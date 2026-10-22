@@ -17,7 +17,7 @@
 use mwc_crates::serde::{self, Deserialize, Serialize};
 use mwc_crates::serde_json;
 use std::convert::From;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use mwc_crates::rand::{rng, RngExt};
@@ -119,6 +119,9 @@ impl Default for ChainValidationMode {
 pub struct ServerConfig {
 	/// Directory under which the rocksdb stores will be created
 	pub db_root: String,
+	/// One-shot explicit local-policy recovery; never persisted to config files.
+	#[serde(skip)]
+	pub clear_local_checkpoint_on_start: bool,
 
 	/// Network address for the Rest API HTTP server.
 	pub api_http_addr: String,
@@ -193,6 +196,7 @@ impl Default for ServerConfig {
 	fn default() -> ServerConfig {
 		ServerConfig {
 			db_root: "mwc_chain".to_string(),
+			clear_local_checkpoint_on_start: false,
 			api_http_addr: "127.0.0.1:3413".to_string(),
 			api_secret_path: Some(".api_secret".to_string()),
 			foreign_api_secret_path: Some(".foreign_api_secret".to_string()),
@@ -398,6 +402,49 @@ impl PartialEq for WebHooksConfig {
 	}
 }
 
+#[cfg(all(test, feature = "test-support"))]
+mod relay_ownership_tests {
+	use super::*;
+	use mwc_crates::parking_lot::RwLock;
+	use mwc_core::{pow::Difficulty, ser::ProtocolVersion};
+	use mwc_p2p::{Capabilities, Direction, PeerAddr, PeerInfo, Peers, P2PConfig};
+	use mwc_p2p::{types::PeerLiveInfo, store::PeerStore};
+
+	#[test]
+	fn cached_relay_does_not_retain_peer_or_database_owner_across_restarts() {
+		global::set_local_chain_type(ChainTypes::AutomatedTesting);
+		global::set_local_accept_fee_base(1).unwrap();
+		let dir = mwc_crates::tempfile::TempDir::new().unwrap();
+		for _ in 0..12 {
+			let peers = Arc::new(Peers::new(
+				PeerStore::new(0, dir.path().to_str().unwrap()).unwrap(),
+				Arc::new(mwc_p2p::DummyAdapter {}), &P2PConfig::default(),
+			));
+			let owner = Arc::downgrade(&peers);
+			let peer = Arc::new(mwc_p2p::Peer::for_ownership_test(PeerInfo {
+				capabilities: Capabilities::UNKNOWN,
+				user_agent: "ownership-test".into(),
+				version: ProtocolVersion::local(),
+				addr: PeerAddr::Ip("127.0.0.1:3414".parse().unwrap()),
+				direction: Direction::Outbound,
+				live_info: Arc::new(RwLock::new(PeerLiveInfo::new(Difficulty::min()))),
+				tx_base_fee: 0,
+			}, peers.clone(), 0));
+			let weak_peer = Arc::downgrade(&peer);
+			let mut epoch = DandelionEpoch::new(0, DandelionConfig::default());
+			epoch.remember_relay(Some(peer.clone()));
+			assert_eq!(Arc::strong_count(&peer), 1);
+			assert!(epoch.relay_peer.as_ref().unwrap().upgrade().is_some());
+			drop(peer);
+			assert!(weak_peer.upgrade().is_none());
+			// Expired cache must fall back to the live peer set (empty here).
+			assert!(epoch.relay_peer(&peers).is_none());
+			drop(peers);
+			assert!(owner.upgrade().is_none(), "relay retained the peer database owner");
+		}
+	}
+}
+
 /// A node is either "stem" of "fluff" for the duration of a single epoch.
 /// A node also maintains an outbound relay peer for the epoch.
 #[derive(Debug)]
@@ -408,12 +455,17 @@ pub struct DandelionEpoch {
 	// Are we in "stem" mode or "fluff" mode for this epoch?
 	is_stem: bool,
 	// Our current Dandelion relay peer (effective for this epoch).
-	relay_peer: Option<Arc<mwc_p2p::Peer>>,
+	// A strong relay closes a cycle through Peer -> Peers -> network adapter ->
+	// transaction pool -> epoch, retaining the sync manager and LMDB after stop.
+	relay_peer: Option<Weak<mwc_p2p::Peer>>,
 	// App session id
 	context_id: u32,
 }
 
 impl DandelionEpoch {
+	fn remember_relay(&mut self, peer: Option<Arc<mwc_p2p::Peer>>) {
+		self.relay_peer = peer.as_ref().map(Arc::downgrade);
+	}
 	/// Create a new Dandelion epoch, defaulting to "stem" and no outbound relay peer.
 	pub fn new(context_id: u32, config: DandelionConfig) -> DandelionEpoch {
 		DandelionEpoch {
@@ -443,19 +495,20 @@ impl DandelionEpoch {
 	pub fn next_epoch(&mut self, peers: &Arc<mwc_p2p::Peers>) {
 		self.start_time = Some(Instant::now());
 		let my_fee_base = global::get_accept_fee_base(self.context_id);
-		self.relay_peer = peers
+		let relay = peers
 			.iter()
 			.filter(move |p| {
 				p.is_connected() && p.info.is_outbound() && p.info.tx_base_fee <= my_fee_base
 			})
 			.choose_random();
+		self.remember_relay(relay);
 
 		// If stem_probability == 90 then we stem 90% of the time.
 		let stem_probability = self.config.stem_probability;
 		let mut rng = rng();
 		self.is_stem = rng.random_range(0..100) < stem_probability;
 
-		let addr = self.relay_peer.clone().map(|p| p.info.addr.clone());
+		let addr = self.relay_peer.as_ref().and_then(Weak::upgrade).map(|p| p.info.addr.clone());
 		info!(
 			"DandelionEpoch: next_epoch: is_stem: {} ({}%), relay: {:?}",
 			self.is_stem, stem_probability, addr
@@ -476,7 +529,7 @@ impl DandelionEpoch {
 	/// If it is not connected then choose a new one.
 	pub fn relay_peer(&mut self, peers: &Arc<mwc_p2p::Peers>) -> Option<Arc<mwc_p2p::Peer>> {
 		let mut update_relay = false;
-		if let Some(peer) = &self.relay_peer {
+		if let Some(peer) = self.relay_peer.as_ref().and_then(Weak::upgrade) {
 			if !peer.is_connected() {
 				info!(
 					"DandelionEpoch: relay_peer: {:?} not connected, choosing a new one.",
@@ -490,18 +543,19 @@ impl DandelionEpoch {
 
 		if update_relay {
 			let my_fee_base = global::get_accept_fee_base(self.context_id);
-			self.relay_peer = peers
+			let relay = peers
 				.iter()
 				.filter(move |p| {
 					p.is_connected() && p.info.is_outbound() && p.info.tx_base_fee <= my_fee_base
 				})
 				.choose_random();
+			self.remember_relay(relay);
 			info!(
 				"DandelionEpoch: relay_peer: new peer chosen: {:?}",
-				self.relay_peer.clone().map(|p| p.info.addr.clone())
+				self.relay_peer.as_ref().and_then(Weak::upgrade).map(|p| p.info.addr.clone())
 			);
 		}
 
-		self.relay_peer.clone()
+		self.relay_peer.as_ref().and_then(Weak::upgrade)
 	}
 }

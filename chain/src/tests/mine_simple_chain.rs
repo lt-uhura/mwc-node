@@ -36,6 +36,7 @@ use mwc_keychain::{
 	BlindSum, ExtKeychain, ExtKeychainPath, Identifier, Keychain, SwitchCommitmentType,
 };
 use mwc_util::StopState;
+use mwc_util::ToHex;
 use std::collections::HashSet;
 use std::convert::TryInto;
 #[cfg(unix)]
@@ -133,6 +134,200 @@ fn mine_empty_chain() {
 	clean_output_dir(chain_dir);
 }
 
+// A restart must retain every durably accepted archive body, even while the
+// header chain is ahead. Only newly received bodies should need processing.
+#[test]
+fn archive_restart_preserves_committed_bodies_and_continues_at_next_height() {
+	global::set_local_chain_type(ChainTypes::AutomatedTesting);
+	global::set_local_nrd_enabled(false);
+	let dir = mwc_crates::tempfile::tempdir().unwrap();
+	let chain_dir = dir.path().to_str().unwrap();
+	let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+	let keychain =
+		ExtKeychain::from_seed(&secp, &SecretKey::new(&secp, &mut SysRng).unwrap().0, false)
+			.unwrap();
+	let genesis = genesis_block(&mut secp, &keychain);
+	let open = |secp: &Secp256k1, skip_validation| {
+		Chain::init(
+			secp,
+			0,
+			chain_dir.to_owned(),
+			Arc::new(NoopAdapter {}),
+			genesis.clone(),
+			accept_test_pow,
+			true,
+			HashSet::new(),
+			None,
+			None,
+			skip_validation,
+		)
+		.unwrap()
+	};
+	let mut chain = open(&secp, false);
+	let mut retained = vec![];
+	for height in 1..=3 {
+		let block = prepare_block_key_idx(
+			&mut secp,
+			&keychain,
+			&chain.head_header().unwrap(),
+			&chain,
+			1,
+			height + 10,
+		);
+		retained.push(block.clone());
+		chain
+			.process_block(&mut secp, block, Options::SKIP_POW, HashSet::new())
+			.unwrap();
+	}
+	// Exercise both normal validation and the mobile app's startup setting.
+	for skip_validation in [true, false, true] {
+		let committed_tip = chain.head().unwrap();
+		let next = prepare_block_key_idx(
+			&mut secp,
+			&keychain,
+			&chain.head_header().unwrap(),
+			&chain,
+			1,
+			committed_tip.height as u32 + 11,
+		);
+		chain
+			.process_block_header(&next.header, Options::SKIP_POW)
+			.unwrap();
+		let header_tip = chain.header_head().unwrap();
+		mwc_chain::pipe::release_context_data(chain.get_context_id());
+		drop(chain);
+		chain = open(&secp, skip_validation);
+		assert!(chain.archive_mode());
+		assert_eq!(chain.head().unwrap(), committed_tip);
+		assert_eq!(chain.header_head().unwrap(), header_tip);
+		for expected in &retained {
+			let stored = chain.get_block_for_header(&expected.header).unwrap();
+			assert_eq!(stored.hash(0).unwrap(), expected.hash(0).unwrap());
+			assert_eq!(stored.outputs(), expected.outputs());
+			assert_eq!(stored.kernels().len(), expected.kernels().len());
+			for (actual, expected) in stored.kernels().iter().zip(expected.kernels()) {
+				assert_eq!(actual.features, expected.features);
+				assert_eq!(actual.excess, expected.excess);
+				assert_eq!(actual.excess_sig, expected.excess_sig);
+			}
+		}
+		chain.validate(&secp, false).unwrap();
+		retained.push(next.clone());
+		chain
+			.process_block(&mut secp, next, Options::SKIP_POW, HashSet::new())
+			.unwrap();
+		assert_eq!(chain.head().unwrap().height, committed_tip.height + 1);
+	}
+	mwc_chain::pipe::release_context_data(chain.get_context_id());
+	drop(chain);
+}
+
+#[test]
+fn archive_relaunch_after_committed_process_exit_preserves_progress() {
+	let dir = mwc_crates::tempfile::tempdir().unwrap();
+	for phase in [
+		"commit_and_exit",
+		"verify_and_continue",
+		"verify_and_continue",
+	] {
+		let output = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"tests::mine_simple_chain::archive_relaunch_child",
+				"--ignored",
+				"--nocapture",
+			])
+			.env("MWC_ARCHIVE_RESTART_TEST_DIR", dir.path())
+			.env("MWC_ARCHIVE_RESTART_TEST_PHASE", phase)
+			.output()
+			.unwrap();
+		assert!(
+			output.status.success(),
+			"{} failed:\n{}\n{}",
+			phase,
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+}
+
+// Runs only in a fresh subprocess launched by the regression above. Exiting
+// immediately after commit deliberately bypasses Chain's Rust destructors.
+#[test]
+#[ignore]
+fn archive_relaunch_child() {
+	let Ok(dir) = std::env::var("MWC_ARCHIVE_RESTART_TEST_DIR") else {
+		return;
+	};
+	let phase = std::env::var("MWC_ARCHIVE_RESTART_TEST_PHASE").unwrap();
+	global::set_local_chain_type(ChainTypes::AutomatedTesting);
+	global::set_local_nrd_enabled(false);
+	let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+	let keychain = ExtKeychain::from_seed(&secp, &[42; 32], false).unwrap();
+	let genesis = global::get_genesis_block(&secp, 0).unwrap();
+	let chain = Chain::init(
+		&secp,
+		0,
+		dir.clone(),
+		Arc::new(NoopAdapter {}),
+		genesis,
+		accept_test_pow,
+		true,
+		HashSet::new(),
+		None,
+		None,
+		true,
+	)
+	.unwrap();
+	let checkpoint = std::path::Path::new(&dir).join("test-expected-block-hashes.json");
+	let mut hashes: Vec<Hash> = if phase == "commit_and_exit" {
+		vec![]
+	} else {
+		mwc_crates::serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap()
+	};
+	assert_eq!(chain.head().unwrap().height, hashes.len() as u64);
+	for (idx, hash) in hashes.iter().enumerate() {
+		let header = chain.get_header_by_height(idx as u64 + 1).unwrap();
+		assert_eq!(header.hash(0).unwrap(), *hash);
+		assert_eq!(
+			chain
+				.get_block_for_header(&header)
+				.unwrap()
+				.hash(0)
+				.unwrap(),
+			*hash
+		);
+	}
+	chain.validate(&secp, false).unwrap();
+	let count = if phase == "commit_and_exit" { 3 } else { 1 };
+	for _ in 0..count {
+		let next_height = chain.head().unwrap().height + 1;
+		let block = prepare_block_key_idx(
+			&mut secp,
+			&keychain,
+			&chain.head_header().unwrap(),
+			&chain,
+			1,
+			next_height as u32,
+		);
+		hashes.push(block.hash(0).unwrap());
+		chain
+			.process_block(&mut secp, block, Options::SKIP_POW, HashSet::new())
+			.unwrap();
+	}
+	assert_eq!(chain.head().unwrap().last_block_h, *hashes.last().unwrap());
+	std::fs::write(
+		&checkpoint,
+		mwc_crates::serde_json::to_vec(&hashes).unwrap(),
+	)
+	.unwrap();
+	if phase == "commit_and_exit" {
+		std::process::exit(0);
+	}
+	mwc_chain::pipe::release_context_data(chain.get_context_id());
+	drop(chain);
+}
+
 #[test]
 fn mine_short_chain() {
 	let chain_dir = ".mwc.short";
@@ -140,6 +335,224 @@ fn mine_short_chain() {
 	let chain = mine_chain(chain_dir, 4);
 	assert_eq!(chain.head().unwrap().height, 3);
 	clean_output_dir(chain_dir);
+}
+
+#[test]
+fn rolling_checkpoint_advances_only_caught_up_and_preserves_pause_across_restart() {
+	global::set_local_chain_type(ChainTypes::AutomatedTesting);
+	global::set_local_nrd_enabled(false);
+	let dir = test_chain_dir("rolling_checkpoint");
+	clean_output_dir(&dir);
+	let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+	let genesis = global::get_genesis_block(&secp, 0).unwrap();
+	let kc = ExtKeychain::from_seed(&secp, &SecretKey::new(&secp, &mut SysRng).unwrap().0, false).unwrap();
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis.clone());
+	let mut blocks = vec![];
+	for n in 1..=6 {
+		let b = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, n);
+		process_block(&mut secp, &chain, &b);
+		blocks.push(b);
+	}
+	let deep = prepare_block(&mut secp, &kc, &blocks[4].header, &chain, 200);
+	let shallow = prepare_block(&mut secp, &kc, &blocks[5].header, &chain, 100);
+	let pin = chain.preview_local_checkpoint(3).unwrap();
+	assert!(chain.configure_local_checkpoint(pin.height, &pin.last_block_h.to_hex(), Some(0)).is_err());
+	assert!(chain.configure_local_checkpoint(pin.height, &pin.last_block_h.to_hex(), Some(4)).is_err());
+	chain.configure_local_checkpoint(pin.height, &pin.last_block_h.to_hex(), Some(3)).unwrap();
+	for n in 7..=8 {
+		let b = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, n);
+		chain.process_block_header(&b.header, Options::SKIP_POW).unwrap();
+		assert!(chain.advance_rolling_checkpoint(true).unwrap().is_none()); // Header-only tip.
+		process_block(&mut secp, &chain, &b);
+		assert!(chain.advance_rolling_checkpoint(false).unwrap().is_none()); // Offline/catching up.
+		assert_eq!(chain.local_checkpoint().unwrap(), Some(pin));
+	}
+	let advanced = chain.advance_rolling_checkpoint(true).unwrap().unwrap();
+	assert_eq!(advanced.height, 5);
+	assert_eq!(advanced.last_block_h, blocks[4].hash(0).unwrap());
+	drop(chain);
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis.clone());
+	assert_eq!(chain.rolling_checkpoint_depth().unwrap(), Some(3));
+	assert!(!chain.local_checkpoint_conflict());
+	assert_eq!(chain.local_checkpoint().unwrap(), Some(advanced));
+	let next = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, 9);
+	process_block(&mut secp, &chain, &next);
+	let advanced = chain.advance_rolling_checkpoint(true).unwrap().unwrap();
+	assert_eq!(advanced.height, 6);
+	process_block(&mut secp, &chain, &shallow); // Shorter, higher-work compatible fork.
+	assert_eq!(chain.head().unwrap().height, 7);
+	assert!(chain.advance_rolling_checkpoint(true).unwrap().is_none());
+	assert_eq!(chain.local_checkpoint().unwrap(), Some(advanced)); // Never backward.
+	for n in 101..=103 {
+		let b = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, n);
+		process_block(&mut secp, &chain, &b);
+	}
+	let advanced = chain.advance_rolling_checkpoint(true).unwrap().unwrap();
+	assert_eq!(advanced.height, 7);
+	assert_eq!(advanced.last_block_h, shallow.hash(0).unwrap());
+	assert!(chain.process_block_header(&deep.header, Options::SKIP_POW).is_err());
+	assert!(chain.local_checkpoint_conflict());
+	drop(chain); // No graceful flush is needed to persist a conflict pause.
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis.clone());
+	assert!(chain.local_checkpoint_conflict());
+	let next = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, 104);
+	process_block(&mut secp, &chain, &next);
+	assert!(chain.advance_rolling_checkpoint(true).unwrap().is_none());
+	assert_eq!(chain.local_checkpoint().unwrap(), Some(advanced));
+	assert_eq!(chain.freeze_local_checkpoint().unwrap(), Some(advanced));
+	assert_eq!(chain.rolling_checkpoint_depth().unwrap(), None);
+	assert!(chain.local_checkpoint_conflict()); // Mode change does not hide warning.
+	drop(chain);
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis.clone());
+	assert_eq!(chain.rolling_checkpoint_depth().unwrap(), None);
+	assert_eq!(chain.local_checkpoint().unwrap(), Some(advanced));
+	assert!(chain.advance_rolling_checkpoint(true).unwrap().is_none());
+	assert!(chain.local_checkpoint_conflict());
+	chain.clear_local_checkpoint().unwrap();
+	assert!(!chain.local_checkpoint_conflict());
+	assert_eq!(chain.local_checkpoint().unwrap(), None);
+	let replacement = chain.preview_local_checkpoint(3).unwrap();
+	chain.configure_local_checkpoint(replacement.height, &replacement.last_block_h.to_hex(), Some(3)).unwrap();
+	drop(chain);
+	// Explicit startup removal clears both mode and pin, but keeps chain data.
+	mwc_chain::ChainStore::clear_local_checkpoint_before_open(0, &dir).unwrap();
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis);
+	assert_eq!(chain.rolling_checkpoint_depth().unwrap(), None);
+	assert_eq!(chain.local_checkpoint().unwrap(), None);
+	assert_eq!(chain.head().unwrap().height, 11);
+	drop(chain);
+	clean_output_dir(&dir);
+}
+
+#[test]
+fn local_checkpoint_blocks_deep_higher_work_forks_but_allows_shallow_reorgs() {
+	global::set_local_chain_type(ChainTypes::AutomatedTesting);
+	global::set_local_nrd_enabled(false);
+	let dir = test_chain_dir("local_checkpoint_forks");
+	clean_output_dir(&dir);
+	let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+	let genesis = global::get_genesis_block(&secp, 0).unwrap();
+	let kc = ExtKeychain::from_seed(&secp, &SecretKey::new(&secp, &mut SysRng).unwrap().0, false).unwrap();
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis.clone());
+	let mut blocks = vec![];
+	for n in 1..=6 {
+		let b = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, n);
+		process_block(&mut secp, &chain, &b);
+		blocks.push(b);
+	}
+	let deep = prepare_block(&mut secp, &kc, &blocks[1].header, &chain, 100);
+	let shallow = prepare_block(&mut secp, &kc, &blocks[2].header, &chain, 101);
+	let original = chain.head().unwrap();
+	assert!(chain.preview_local_checkpoint(0).is_err());
+	assert!(chain.preview_local_checkpoint(6).is_err());
+	let pin = chain.preview_local_checkpoint(3).unwrap();
+	assert_eq!(pin.height, 3);
+	assert!(chain.set_local_checkpoint(pin.height, "wrong hash").is_err());
+	chain.set_local_checkpoint(pin.height, &pin.last_block_h.to_hex()).unwrap();
+	assert!(chain.set_local_checkpoint(2, &blocks[1].hash(0).unwrap().to_hex()).is_err());
+	let error = chain.process_block_header(&deep.header, Options::SKIP_POW).unwrap_err();
+	assert!(error.to_string().contains("Local checkpoint conflict"), "{error}");
+	assert!(!error.is_bad_data()); // Local policy must not ban an otherwise-valid peer.
+	let batch_error = chain.sync_block_headers(&[deep.header.clone()], original, Options::SKIP_POW).unwrap_err();
+	assert!(batch_error.to_string().contains("Local checkpoint conflict"));
+	assert!(!batch_error.is_bad_data());
+	assert!(chain.process_block(&mut secp, deep.clone(), Options::SKIP_POW, HashSet::new()).is_err());
+	assert_eq!(chain.head().unwrap(), original);
+	assert_eq!(chain.header_head().unwrap(), original);
+	assert!(chain.local_checkpoint_conflict());
+	process_block(&mut secp, &chain, &shallow);
+	assert_eq!(chain.head().unwrap().last_block_h, shallow.hash(0).unwrap());
+	assert_eq!(chain.local_checkpoint().unwrap(), Some(pin)); // Fixed, not rolling.
+	drop(chain);
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis);
+	assert_eq!(chain.local_checkpoint().unwrap(), Some(pin));
+	assert!(chain.process_block_header(&deep.header, Options::SKIP_POW).is_err());
+	chain.clear_local_checkpoint().unwrap();
+	assert_eq!(chain.local_checkpoint().unwrap(), None);
+	// More work than the shallow branch after explicitly removing the policy.
+	let deeper = prepare_block(&mut secp, &kc, &blocks[1].header, &chain, 200);
+	process_block(&mut secp, &chain, &deeper);
+	assert_eq!(chain.head().unwrap().last_block_h, deeper.hash(0).unwrap());
+	drop(chain);
+	clean_output_dir(&dir);
+}
+
+#[test]
+fn local_checkpoint_checks_preexisting_forks_and_all_head_writes() {
+	global::set_local_chain_type(ChainTypes::AutomatedTesting);
+	global::set_local_nrd_enabled(false);
+	let dir = test_chain_dir("local_checkpoint_persisted_fork");
+	clean_output_dir(&dir);
+	let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+	let genesis = global::get_genesis_block(&secp, 0).unwrap();
+	let kc = ExtKeychain::from_seed(&secp, &SecretKey::new(&secp, &mut SysRng).unwrap().0, false).unwrap();
+	let chain = init_chain_accepting_test_pow(&secp, &dir, genesis);
+	let a = prepare_block(&mut secp, &kc, &chain.head_header().unwrap(), &chain, 1);
+	process_block(&mut secp, &chain, &a);
+	let b = prepare_block(&mut secp, &kc, &a.header, &chain, 10);
+	let alternative = prepare_block(&mut secp, &kc, &a.header, &chain, 2);
+	process_block(&mut secp, &chain, &b);
+	process_block(&mut secp, &chain, &alternative);
+	let c = prepare_block(&mut secp, &kc, &b.header, &chain, 11);
+	process_block(&mut secp, &chain, &c);
+	let old_snapshot = chain.init_desegmenter(2, Hash::from_vec(&[0; 32])).unwrap();
+	assert!(old_snapshot.is_current());
+	let pin = chain.preview_local_checkpoint(1).unwrap();
+	chain.set_local_checkpoint(pin.height, &pin.last_block_h.to_hex()).unwrap();
+	assert!(!old_snapshot.is_current());
+	let store = chain.get_store_for_tests();
+	let rejected_snapshot = mwc_chain::txhashset::Desegmenter::new_guarded(
+		chain.get_txhashset_for_test(), chain.get_header_pmmr_for_test(),
+		alternative.header.clone(), Hash::from_vec(&[0; 32]), chain.genesis(), store.clone(),
+		Arc::new(mwc_chain::pibd_params::PibdParams::new()),
+		Arc::new(std::sync::atomic::AtomicBool::new(false)),
+		Arc::new(std::sync::atomic::AtomicU64::new(0)), 0,
+	);
+	assert!(matches!(rejected_snapshot, Err(ref e) if e.to_string().contains("Local checkpoint conflict")));
+	drop(old_snapshot);
+	{
+		let mut batch = store.batch_write().unwrap();
+		let fork_tip = Tip::try_from_header(&alternative.header).unwrap();
+		assert!(batch.save_body_head(&fork_tip).is_err());
+		assert!(batch.save_header_head(&fork_tip).is_err());
+		assert!(batch.save_block_header(&alternative.header).is_err());
+		assert!(batch.save_block(&alternative).is_err());
+		assert!(batch.child().unwrap().validate_checkpoint_header(&alternative.header).is_err());
+		// Canonical ancestors remain available for recovery/replay.
+		batch.validate_checkpoint_header(&a.header).unwrap();
+		batch.validate_checkpoint_header(&b.header).unwrap();
+		batch.validate_checkpoint_header(&c.header).unwrap();
+		// A proof-derived hash alone must never let an altered header seed an
+		// ancestry-cache entry for a different complete header using that proof.
+		let mut fork_child = c.header.clone();
+		fork_child.prev_hash = alternative.hash(0).unwrap();
+		assert_eq!(fork_child.hash(0).unwrap(), c.hash(0).unwrap());
+		assert!(batch.validate_checkpoint_header(&fork_child).is_err());
+	}
+	assert_eq!(chain.head().unwrap().last_block_h, c.hash(0).unwrap());
+	let fork_tip = Tip::try_from_header(&alternative.header).unwrap();
+	{
+		// Simulate a downgraded binary that does not know the policy key.
+		let batch = store.batch_write().unwrap();
+		batch.db.put_ser(&[b'H'], &fork_tip).unwrap();
+		batch.db.put_ser(&[b'G'], &fork_tip).unwrap();
+		batch.commit().unwrap();
+	}
+	drop(store);
+	drop(chain);
+	let error = match mwc_chain::ChainStore::new(0, &dir) {
+		Ok(_) => panic!("conflicting persisted head must fail closed"),
+		Err(error) => error,
+	};
+	assert!(error.to_string().contains("Local checkpoint conflict"));
+	// Explicit startup recovery removes only the policy, not blocks or heads.
+	mwc_chain::ChainStore::clear_local_checkpoint_before_open(0, &dir).unwrap();
+	let reopened = mwc_chain::ChainStore::new(0, &dir).unwrap();
+	assert!(reopened.local_checkpoint().unwrap().is_none());
+	assert_eq!(reopened.head().unwrap(), fork_tip);
+	assert_eq!(reopened.get_block(&c.hash(0).unwrap()).unwrap().header, c.header);
+	drop(reopened);
+	clean_output_dir(&dir);
 }
 
 #[test]
@@ -701,12 +1114,24 @@ fn restart_during_pibd_resets_compacted_body_and_keeps_headers() {
 
 		let retained_header_head = chain.header_head().unwrap();
 		let genesis_head = Tip::try_from_header(&genesis.header).unwrap();
+		// Model segment-only PIBD state, not a retained validated body chain.
+		// Full bodies above genesis intentionally prevent destructive PIBD reset
+		// recovery. Preserve their headers and compacted PMMR state here.
+		let body_hashes: Vec<_> = (1..=retained_header_head.height)
+			.map(|height| chain.get_header_by_height(height).unwrap().hash(0).unwrap())
+			.collect();
 		{
 			let store = chain.get_store_for_tests();
 			let batch = store.batch_write().unwrap();
+			for hash in body_hashes {
+				batch.delete_block(&hash).unwrap();
+			}
 			batch.save_body_head(&genesis_head).unwrap();
 			batch.save_body_tail(&genesis_head).unwrap();
 			batch.commit().unwrap();
+			assert!(!store
+				.has_full_blocks_above_genesis(&genesis_head.last_block_h)
+				.unwrap());
 		}
 		drop(chain);
 
@@ -2774,7 +3199,7 @@ fn migrate_spent_index_deletes_records_outside_active_window() {
 				.unwrap();
 			batch.commit().unwrap();
 		}
-		Chain::init_spent_commitment_index(&store, None).unwrap();
+		Chain::init_spent_commitment_index(&store, None, false).unwrap();
 		let batch = store.batch_read().unwrap();
 		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
 	}

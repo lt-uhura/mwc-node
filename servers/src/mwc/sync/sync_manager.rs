@@ -479,6 +479,18 @@ impl SyncManager {
 		)
 	}
 
+	pub fn clear_body_request(&self, block_hash: &Hash, peer: &PeerAddr) {
+		self.body.clear_request(block_hash, peer);
+	}
+
+	pub fn body_request_age_at(&self, hash: &Hash, peer: &PeerAddr, arrived: std::time::Instant) -> Option<Duration> {
+		self.body.request_age_at(hash, peer, arrived)
+	}
+
+	pub fn record_body_delivery(&self, peer: &PeerAddr, age: Duration) {
+		self.body.record_delivery(peer, age);
+	}
+
 	// return true if need to request prev block
 	pub fn recieve_block_reporting(
 		&self,

@@ -20,7 +20,7 @@ use crate::msg::{
 };
 use crate::peer::Peer;
 use crate::tor::arti::{canonical_onion_v3, is_valid_onion_v3, parse_onion_expanded_key};
-use crate::tor::tcp_data_stream::TcpDataStream;
+use crate::tor::tcp_data_stream::{TcpData, TcpDataStream};
 use crate::types::{
 	Capabilities, Direction, Error, NetAdapter, P2PConfig, PeerAddr, PeerAddr::Ip, PeerAddr::Onion,
 	PeerInfo, PeerLiveInfo,
@@ -43,7 +43,7 @@ use std::convert::TryFrom;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Local generated nonce for peer connecting.
 /// Used for self-connecting detection (on receiver side),
@@ -57,6 +57,9 @@ const ADDRS_CAP: usize = 10;
 /// The initial Hand message should come in immediately after the connection is initiated.
 /// But for consistency use the same timeout for reading both Hand and Shake messages.
 const HAND_READ_TIMEOUT: Duration = Duration::from_millis(15_000);
+
+// Keep the total deadline bounded even on slow mobile onion streams.
+const MOBILE_ONION_HAND_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// We need to allow time for the peer to receive our Hand message and send back a Shake reply.
 const SHAKE_READ_TIMEOUT: Duration = Duration::from_millis(15_000);
@@ -218,8 +221,8 @@ impl Handshake {
 		Ok(version)
 	}
 
-	fn validate_inbound_receiver_addr(&self, hand: &Hand) -> Result<(), Error> {
-		if self.onion_address.is_some() {
+	fn validate_inbound_receiver_addr(&self, hand: &Hand, onion_transport: bool) -> Result<(), Error> {
+		if onion_transport {
 			return self.validate_tor_receiver_addr(&hand.receiver_addr, &hand.sender_addr);
 		}
 
@@ -236,8 +239,8 @@ impl Handshake {
 		self.validate_ip_receiver_addr(receiver_addr, &hand.sender_addr)
 	}
 
-	fn observe_inbound_receiver_addr(&self, hand: &Hand, sender_addr: &PeerAddr) {
-		if self.onion_address.is_some() {
+	fn observe_inbound_receiver_addr(&self, hand: &Hand, sender_addr: &PeerAddr, onion_transport: bool) {
+		if onion_transport {
 			return;
 		}
 		if let Ip(receiver_addr) = &hand.receiver_addr {
@@ -427,15 +430,25 @@ impl Handshake {
 		Ok(Some(keypair.sign(&transcript).to_bytes()))
 	}
 
-	fn verify_onion_hand_proof(&self, hand: &Hand, adapter: &dyn NetAdapter) -> Result<(), Error> {
+	fn verify_onion_hand_proof(&self, hand: &Hand, adapter: &dyn NetAdapter, onion_transport: bool) -> Result<(), Error> {
 		let stored_version = adapter.peer_version(&hand.sender_addr)?;
-		self.verify_onion_hand_proof_with_stored_version(hand, stored_version)
+		self.verify_onion_hand_proof_for_transport(hand, stored_version, onion_transport)
 	}
 
+	#[cfg(test)]
 	fn verify_onion_hand_proof_with_stored_version(
 		&self,
 		hand: &Hand,
 		stored_version: Option<ProtocolVersion>,
+	) -> Result<(), Error> {
+		self.verify_onion_hand_proof_for_transport(hand, stored_version, self.onion_address.is_some())
+	}
+
+	fn verify_onion_hand_proof_for_transport(
+		&self,
+		hand: &Hand,
+		stored_version: Option<ProtocolVersion>,
+		onion_transport: bool,
 	) -> Result<(), Error> {
 		let sender_onion = match &hand.sender_addr {
 			Onion(onion) => onion,
@@ -462,7 +475,7 @@ impl Handshake {
 			return Ok(());
 		}
 
-		if self.onion_address.is_some() {
+		if onion_transport {
 			self.validate_tor_receiver_addr(&hand.receiver_addr, &hand.sender_addr)?;
 		}
 
@@ -625,15 +638,28 @@ impl Handshake {
 		// Set explicit timeouts on the tcp stream for hand/shake messages.
 		// Once the peer is up and running we will set new values for these.
 		// We accept an inbound connection, reading a Hand then writing a Shake reply.
-		conn.set_read_timeout(HAND_READ_TIMEOUT);
+		let onion_transport = matches!(&conn.stream, TcpData::Tor(_));
+		let hand_timeout = if cfg!(target_os = "ios") && onion_transport {
+			MOBILE_ONION_HAND_READ_TIMEOUT
+		} else {
+			HAND_READ_TIMEOUT
+		};
+		let transport = if onion_transport { "onion" } else { "tcp" };
+		let started = Instant::now();
+		info!("P2P inbound Hand waiting transport={} deadline_ms={}", transport, hand_timeout.as_millis());
+		conn.set_read_timeout(hand_timeout);
 		conn.set_write_timeout(SHAKE_WRITE_TIMEOUT);
 
 		// A per-read idle timeout is insufficient here because read_exact may make
 		// repeated partial reads. Bound the complete Hand message to one deadline.
 		let hand: Hand = {
-			let mut reader = conn.deadline_reader(HAND_READ_TIMEOUT);
-			read_hand_message(&mut reader, self.protocol_version, self.context_id)?
+			let mut reader = conn.deadline_reader(hand_timeout);
+			read_hand_message(&mut reader, self.protocol_version, self.context_id).map_err(|err| {
+				info!("P2P inbound Hand failed transport={} elapsed_ms={} err={}", transport, started.elapsed().as_millis(), err);
+				err
+			})?
 		};
+		info!("P2P inbound Hand received transport={} elapsed_ms={}", transport, started.elapsed().as_millis());
 
 		if hand.genesis != self.genesis {
 			return Err(Error::GenesisMismatch {
@@ -646,7 +672,7 @@ impl Handshake {
 		// Check the nonce to see if we are trying to connect to ourselves.
 		let peer_with_self = self.nonces.read_recursive().contains(&hand.nonce);
 
-		self.verify_onion_hand_proof(&hand, adapter)?;
+		self.verify_onion_hand_proof(&hand, adapter, onion_transport)?;
 
 		let negotiated_version = self.negotiate_protocol_version(hand.version)?;
 
@@ -681,7 +707,7 @@ impl Handshake {
 			)));
 		}
 
-		self.validate_inbound_receiver_addr(&hand)?;
+		self.validate_inbound_receiver_addr(&hand, onion_transport)?;
 
 		if peer_with_self {
 			self.record_peer_with_self_addr(&hand, &addr);
@@ -701,13 +727,13 @@ impl Handshake {
 		let msg = Msg::new(Type::Shake, shake, negotiated_version, self.context_id)?;
 		write_message(conn, &vec![msg], self.tracker.clone())?;
 
-		self.observe_inbound_receiver_addr(&hand, &addr);
+		self.observe_inbound_receiver_addr(&hand, &addr, onion_transport);
 
 		// all good, keep peer info
 		let peer_info = PeerInfo {
 			capabilities: hand.capabilities,
 			user_agent: hand.user_agent,
-			direction: if addr.tor_address().is_ok() {
+			direction: if onion_transport {
 				Direction::InboundTor
 			} else {
 				Direction::Inbound
@@ -1320,7 +1346,7 @@ mod tests {
 			None,
 		);
 
-		receiver_hs.observe_inbound_receiver_addr(&hand, &source_addr);
+		receiver_hs.observe_inbound_receiver_addr(&hand, &source_addr, false);
 
 		assert_eq!(
 			receiver_hs
@@ -1627,6 +1653,17 @@ mod tests {
 		receiver_hs
 			.verify_onion_hand_proof_with_stored_version(&hand, None)
 			.unwrap();
+
+		// A dual-listener node still accepts this signed IP-targeted Hand
+		// over TCP, but must reject the same Hand on its onion transport.
+		let dual_receiver = test_handshake(Some(onion_from_seed(&[17u8; 32])), None);
+		dual_receiver.validate_inbound_receiver_addr(&hand, false).unwrap();
+		dual_receiver.verify_onion_hand_proof_for_transport(&hand, None, false).unwrap();
+		assert!(dual_receiver.validate_inbound_receiver_addr(&hand, true).is_err());
+		assert!(dual_receiver.verify_onion_hand_proof_for_transport(&hand, None, true).is_err());
+		let mut tampered = hand;
+		tampered.receiver_addr = PeerAddr::Ip("127.0.0.1:3415".parse().unwrap());
+		assert!(dual_receiver.verify_onion_hand_proof_for_transport(&tampered, None, false).is_err());
 	}
 
 	#[test]

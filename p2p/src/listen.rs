@@ -21,6 +21,7 @@ use mwc_crates::zeroize::Zeroizing;
 use mwc_util::{run_global_async_block, StopState};
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{io, thread};
 
@@ -38,7 +39,7 @@ pub fn listen<F, G, H, K>(
 where
 	F: Fn(Option<String>),
 	G: Fn(&Error) -> bool, // return true if want to exit on falure
-	H: Fn(TcpDataStream, Option<PeerAddr>),
+	H: Fn(TcpDataStream, Option<PeerAddr>) + Sync,
 	K: Fn(bool) + Send + 'static + std::marker::Sync, // return true if want to exit on falure
 {
 	let tor_config = tor_config.unwrap_or(TorConfig::no_tor_config());
@@ -47,6 +48,48 @@ where
 	// onion address is derived from the local identity key once the onion
 	// service is launched; full reachability is reported separately.
 	if tor_config.is_tor_enabled() {
+		// iOS offers both ingress transports. Only the onion listener owns the
+		// startup callback: a TCP bind must not overwrite our onion identity.
+		if cfg!(target_os = "ios") {
+			let addr = listen_addr.ok_or(Error::Internal("listening port is not set".into()))?;
+			return thread::scope(|scope| {
+				let cancelled = Arc::new(AtomicBool::new(false));
+				let tcp_cancelled = cancelled.clone();
+				let tcp_stop = stop_state.clone();
+				let callback = &handle_new_peer_callback;
+				let tcp = thread::Builder::new()
+					.name(format!("p2p_tcp_listener_{}", context_id))
+					.spawn_scoped(scope, move || {
+						let result = listen_socket(
+							tcp_stop, addr.ip(), addr.port(), None,
+							None::<fn(Option<String>)>, None::<fn(&Error) -> bool>,
+							None::<fn(bool)>, callback, Some(tcp_cancelled),
+						);
+						if let Err(err) = &result {
+							warn!("P2P inbound TCP listener failed; onion listener remains independent: {}", err);
+						}
+						result
+					})
+					.map_err(Error::Connection)?;
+				// Drop before the scope joins, including on panic, so its TCP
+				// worker cannot outlive a failed/stopped onion listener.
+				struct CancelOnDrop(Arc<AtomicBool>);
+				impl Drop for CancelOnDrop {
+					fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); }
+				}
+				let cancel = CancelOnDrop(cancelled);
+				let result = listen_onion_service(
+					context_id, stop_state, onion_expanded_key,
+					started_service_callback, failed_service_callback,
+					service_status_callback, &handle_new_peer_callback,
+				);
+				drop(cancel);
+				if tcp.join().is_err() {
+					return Err(Error::Internal("TCP listener panicked".into()));
+				}
+				result
+			});
+		}
 		listen_onion_service(
 			context_id,
 			stop_state,
@@ -67,6 +110,7 @@ where
 			failed_service_callback,
 			service_status_callback,
 			handle_new_peer_callback,
+			None,
 		)
 	}
 }
@@ -115,6 +159,7 @@ fn listen_socket<F, G, H, K>(
 	failed_service_callback: Option<G>,
 	service_status_callback: Option<K>,
 	handle_new_peer_callback: H,
+	cancelled: Option<Arc<AtomicBool>>,
 ) -> Result<(), Error>
 where
 	F: Fn(Option<String>),
@@ -137,6 +182,7 @@ where
 			if let Some(started_service_callback) = started_service_callback {
 				started_service_callback(onion_service_address);
 			}
+			info!("P2P inbound listener bound on {}:{}", host, port);
 			listener
 		}
 		Err(e) => {
@@ -156,6 +202,10 @@ where
 	};
 
 	loop {
+		if stop_state.is_stopped()
+			|| cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+			break;
+		}
 		// Pause peer ingress connection request. Only for tests.
 		if stop_state.is_paused() {
 			thread::sleep(Duration::from_secs(1));
@@ -194,6 +244,7 @@ where
 
 				let peer_addr = PeerAddr::Ip(normalize_transport_socket_addr(peer_addr));
 
+				info!("P2P inbound TCP accepted from {}", peer_addr);
 				handle_new_peer_callback(TcpDataStream::from_tcp(stream), Some(peer_addr));
 			}
 			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -285,6 +336,42 @@ where
 mod tests {
 	use super::*;
 	use std::sync::{Arc, Mutex};
+
+	#[test]
+	fn tcp_listener_accepts_and_cancels_without_stopping_node() {
+		let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = reservation.local_addr().unwrap();
+		drop(reservation);
+		let stop = Arc::new(StopState::new());
+		let cancelled = Arc::new(AtomicBool::new(false));
+		let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+		let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+		let (done_tx, done_rx) = std::sync::mpsc::channel();
+		let worker_stop = stop.clone();
+		let worker_cancelled = cancelled.clone();
+		let worker = thread::spawn(move || {
+			let result = listen_socket(
+				worker_stop, addr.ip(), addr.port(), None,
+				Some(move |_| { ready_tx.send(()).unwrap(); }),
+				None::<fn(&Error) -> bool>, None::<fn(bool)>,
+				move |_stream, peer| { accepted_tx.send(peer).unwrap(); },
+				Some(worker_cancelled),
+			);
+			done_tx.send(result).unwrap();
+		});
+		ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		let client = std::net::TcpStream::connect(addr).unwrap();
+		let remote = accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+		assert_eq!(remote, Some(PeerAddr::Ip(client.local_addr().unwrap())));
+		// Cancellation must also work while the parent node is paused.
+		stop.pause();
+		cancelled.store(true, Ordering::Relaxed);
+		done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+		worker.join().unwrap();
+		assert!(!stop.is_stopped());
+		// A stopped listener releases its port for a subsequent app session.
+		let _rebound = std::net::TcpListener::bind(addr).unwrap();
+	}
 
 	#[test]
 	fn accept_error_without_failure_callback_marks_service_down_and_returns() {

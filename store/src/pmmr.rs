@@ -960,10 +960,26 @@ impl<T: PMMRable> PMMRBackend<T> {
 	/// each component directly and rely on PMMR consistency checks during later
 	/// reads to detect any partial persistence caused by an I/O failure.
 	pub fn sync(&mut self) -> io::Result<()> {
-		self.hash_file.flush()?;
-		self.data_file.flush()?;
-		self.sync_leaf_set()?;
-		self.prune_list.flush()?;
+		{
+			let mut timing = mwc_util::sync_diagnostics::Metric::BackendHash.start();
+			self.hash_file.flush()?;
+			timing.success();
+		}
+		{
+			let mut timing = mwc_util::sync_diagnostics::Metric::BackendData.start();
+			self.data_file.flush()?;
+			timing.success();
+		}
+		{
+			let mut timing = mwc_util::sync_diagnostics::Metric::BackendLeaf.start();
+			self.sync_leaf_set()?;
+			timing.success();
+		}
+		{
+			let mut timing = mwc_util::sync_diagnostics::Metric::BackendPrune.start();
+			self.prune_list.flush()?;
+			timing.success();
+		}
 		Ok(())
 	}
 

@@ -82,6 +82,7 @@ where
 	E: AsRef<OsStr>,
 {
 	let temp_suffix = temp_suffix.as_ref();
+	let mut file_timing = mwc_util::sync_diagnostics::Metric::BitmapFile.start();
 	// All current callers pass a local, reviewable constant suffix (".tmp").
 	// Keep it that way rather than accepting user-controlled path fragments here.
 	if temp_suffix.is_empty() {
@@ -109,11 +110,15 @@ where
 	}
 	drop(temp_file);
 
+	file_timing.success();
+	drop(file_timing);
+	let mut publish_timing = mwc_util::sync_diagnostics::Metric::BitmapPublish.start();
 	if let Err(e) = rename(&temp_path, &original) {
 		remove_temp_file_or_log(&temp_path, "rename error");
 		return Err(e);
 	}
 	sync_parent_dir(original)?;
+	publish_timing.success();
 
 	Ok(())
 }

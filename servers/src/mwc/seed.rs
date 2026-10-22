@@ -59,6 +59,34 @@ const DELETE_ABSOLETE_PEER_CHANCES: u32 = 150;
 
 type PeerConnectThread = thread::JoinHandle<Result<(), mwc_p2p::Error>>;
 
+// The preferred maintenance target can remain unmet during healthy sync.
+// Only accelerate queued work during boost or a small outbound pool; inbound
+// connections must not suppress bootstrap/recovery. This is a connectivity
+// floor, not a claim that three peers can serve the required block history.
+fn fast_discovery_needed(boost: bool, outbound: usize) -> bool {
+	boost || outbound < 3
+}
+
+// A queue populated after the last dispatch must not wait out a stale full
+// maintenance deadline. Rate-limit this extra wake path even if every queued
+// address is subsequently rejected by reconnect/transport filtering.
+fn queued_discovery_due(
+	now: time::Instant,
+	last_attempt: Option<time::Instant>,
+	has_enough_peers: bool,
+	fast_discovery: bool,
+	queued: usize,
+	connecting: usize,
+) -> bool {
+	!has_enough_peers
+		&& fast_discovery
+		&& queued > 0
+		&& connecting < PEER_CONNECT_POOL_SIZE
+		&& last_attempt.map_or(true, |at| {
+			now.saturating_duration_since(at) >= time::Duration::from_secs(PEERS_CHECK_TIME_BOOST)
+		})
+}
+
 // Peer discovery and monitoring is intentionally best-effort. The returned
 // Result only reports whether the monitor thread was spawned; once running, the
 // JoinHandle returns () and callers cannot observe individual peer-store,
@@ -87,6 +115,8 @@ pub fn connect_and_monitor(
 			let mut expire_check_time = now + time::Duration::from_secs(EXPIRE_INTERVAL);
 			let mut peer_monitor_time = now;
 			let mut listen_time = now;
+			let mut last_discovery_log = now;
+			let mut last_connection_attempt = None;
 
 			let mut connecting_history: HashMap<PeerAddr, time::Instant> = HashMap::new();
 			let mut listen_q_addrs: VecDeque<PeerAddr> = VecDeque::new();
@@ -161,6 +191,13 @@ pub fn connect_and_monitor(
 				let has_enough_peers = peers.enough_outbound_peers();
 
 				let listen_q_is_empty = listen_q_addrs.is_empty();
+				if last_discovery_log.elapsed() >= time::Duration::from_secs(15) {
+					info!("body sync discovery connected={} enough_outbound={} queued={} connecting={} next_connect_ms={} next_monitor_ms={} boost={}",
+						connected_peers, has_enough_peers, listen_q_addrs.len(), connection_threads.len(),
+						peers_connect_time.saturating_duration_since(now).as_millis(),
+						peer_monitor_time.saturating_duration_since(now).as_millis(), peers.is_boosting_mode());
+					last_discovery_log = now;
+				}
 
 				// monitor peers first, then process sent requests with 'listen_for_addrs'
 				if now > peer_monitor_time || (request_more_connections && listen_q_is_empty) {
@@ -195,15 +232,29 @@ pub fn connect_and_monitor(
 
 				// make several attempts to get peers as quick as possible
 				// with exponential backoff
+				let queued_wake = queued_discovery_due(
+					now, last_connection_attempt, has_enough_peers,
+					fast_discovery_needed(
+						peers.is_boosting_mode(), peers.iter().outbound().connected().count(),
+					),
+					listen_q_addrs.len(), connection_threads.len(),
+				);
+				if queued_wake && now < peers_connect_time {
+					info!("body sync discovery wake=queued_capacity queued={} connecting={} previous_next_connect_ms={}",
+						listen_q_addrs.len(), connection_threads.len(),
+						peers_connect_time.saturating_duration_since(now).as_millis());
+				}
 				if now > peers_connect_time
 					|| request_more_connections
 					|| (!has_enough_peers && finished_connection_attempts > 0)
+					|| queued_wake
 				{
 					let is_boost = peers.is_boosting_mode();
 					if has_enough_peers {
 						peers_connect_time = now + time::Duration::from_secs(PEERS_CHECK_TIME_FULL);
 					} else {
 						if connection_threads.len() < PEER_CONNECT_POOL_SIZE {
+							last_connection_attempt = Some(now);
 							// try to connect to any address sent to the channel
 							if let Err(e) = listen_for_addrs(
 								peers.clone(),
@@ -690,9 +741,19 @@ fn listen_for_addrs(
 		let thr = thread::Builder::new()
 			.name(format!("peer_connect_{}", addr))
 			.spawn(move || -> Result<(), mwc_p2p::Error> {
+				let probe = cfg!(target_os = "ios") && matches!(addr_c.to_string().as_str(), "64.23.190.163:3414" | "159.89.145.191:3414");
+				let probe_started = time::Instant::now();
+				if probe { info!("body sync peer_probe peer={} phase=connect_start", addr_c); }
 				// if we don't have a socks port, and it's onion, don't set as defunct because
 				// we don't know.
-				match p2p_c.connect(&addr_c) {
+				let connected = p2p_c.connect(&addr_c);
+				if probe {
+					match &connected {
+						Ok(p) => info!("body sync peer_probe peer={} phase=connected elapsed_ms={} capabilities={:?}", addr_c, probe_started.elapsed().as_millis(), p.info.capabilities),
+						Err(e) => info!("body sync peer_probe peer={} phase=connect_failed elapsed_ms={} error={:?}", addr_c, probe_started.elapsed().as_millis(), e),
+					}
+				}
+				match connected {
 					Ok(p) => {
 						debug!(
 							"New peer {} is connected as outbound! Capability: {:b}",
@@ -908,6 +969,42 @@ pub fn predefined_seeds(addrs: Vec<PeerAddr>) -> Box<dyn Fn() -> Vec<PeerAddr> +
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn queued_discovery_wakes_without_waiting_for_full_deadline() {
+		let now = time::Instant::now();
+		assert!(queued_discovery_due(now, None, false, true, 30, 0));
+		assert!(!queued_discovery_due(now, Some(now), false, true, 30, 0));
+		assert!(!queued_discovery_due(now + time::Duration::from_secs(9), Some(now), false, true, 30, 0));
+		assert!(queued_discovery_due(now + time::Duration::from_secs(10), Some(now), false, true, 30, 0));
+		// Recording even a filtered/failed dispatch prevents a hot retry loop.
+		let retry = now + time::Duration::from_secs(10);
+		assert!(!queued_discovery_due(retry, Some(retry), false, true, 30, 0));
+	}
+
+	#[test]
+	fn queued_discovery_respects_demand_and_worker_capacity() {
+		let now = time::Instant::now();
+		assert!(!queued_discovery_due(now, None, true, true, 30, 0));
+		assert!(!queued_discovery_due(now, None, false, true, 0, 0));
+		assert!(!queued_discovery_due(now, None, false, true, 30, PEER_CONNECT_POOL_SIZE));
+		assert!(queued_discovery_due(now, None, false, true, 30, PEER_CONNECT_POOL_SIZE - 1));
+		assert!(!queued_discovery_due(now, Some(now + time::Duration::from_secs(1)), false, true, 30, 0));
+	}
+
+	#[test]
+	fn queued_discovery_returns_to_maintenance_after_boost() {
+		let now = time::Instant::now();
+		for outbound in [0, 1, 2, 3, 12] {
+			assert!(queued_discovery_due(now, None, false,
+				fast_discovery_needed(true, outbound), 30, 0));
+			assert_eq!(queued_discovery_due(now, None, false,
+				fast_discovery_needed(false, outbound), 30, 0), outbound < 3);
+		}
+		// A depleted outbound pool re-enables wake-ups, but not before cooldown.
+		assert!(!queued_discovery_due(now, Some(now), false,
+			fast_discovery_needed(false, 0), 30, 0));
+	}
 
 	const VALID_ONION: &str = "zwecav6dgftsoscybpzufbo77d452mk3mox2fqzjqocu7265bxgq6oad.onion";
 

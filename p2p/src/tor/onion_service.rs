@@ -73,7 +73,11 @@ where
 		Ok((
 			onion_service,
 			onion_address,
-			Box::pin(tor_hsservice::handle_rend_requests(incoming_requests))
+			Box::pin(tor_hsservice::handle_rend_requests(incoming_requests.inspect(|_| {
+				// This precedes circuit rendezvous and the MWC Hand exchange.
+				// A published descriptor alone cannot tell us whether clients dial.
+				info!("P2P inbound onion rendezvous requested; awaiting Tor session establishment");
+			})))
 				as Pin<Box<dyn futures::Stream<Item = _> + Send>>,
 		))
 	})?;
@@ -143,6 +147,7 @@ where
 		}
 
 		info!("Starting Arti service {}...", service_name);
+		let service_started_at = Instant::now();
 		match start_onion_service(
 			context_id,
 			&onion_expanded_key,
@@ -270,10 +275,11 @@ where
 												};
 
 											info!(
-												"Current {} onion service status: {:?}, ready for traffic: {}",
+												"Current {} onion service status: {:?}, ready for traffic: {}, service_elapsed_ms={}",
 												service_name2,
 												onion_service_status,
 												ready_for_traffic,
+												service_started_at.elapsed().as_millis(),
 											);
 
 											if ready_for_traffic {
@@ -451,6 +457,7 @@ where
 
 					match request_res {
 						Ok(Some(stream_request)) => {
+							info!("P2P inbound onion stream requested service_elapsed_ms={}", service_started_at.elapsed().as_millis());
 							if stop_state.is_stopped() || arti::is_arti_restarting() {
 								break;
 							}
@@ -502,6 +509,7 @@ where
 									match accept_result {
 										Ok(accept_result) => match accept_result {
 											Ok(onion_service_stream) => {
+												info!("P2P inbound onion stream accepted service_elapsed_ms={}", service_started_at.elapsed().as_millis());
 												let stream_id = arti::allocate_arti_object_id();
 												let stream_name = format!(
 													"mwc_nodeLdata_stream_{}_{}",

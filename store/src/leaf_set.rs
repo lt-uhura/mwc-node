@@ -23,10 +23,10 @@ use mwc_crates::croaring::{Bitmap, Portable};
 
 use crate::prune_list::PruneList;
 use crate::{read_bitmap, save_via_temp_file};
+use mwc_core::core::BlockHeader;
 use mwc_core::core::hash::Hashed;
 use mwc_core::core::pmmr;
 use mwc_core::core::pmmr::Error;
-use mwc_core::core::BlockHeader;
 use mwc_util::ToHex;
 
 use mwc_crates::log::debug;
@@ -38,6 +38,8 @@ pub struct LeafSet {
 	path: PathBuf,
 	bitmap: Bitmap,
 	bitmap_bak: Bitmap,
+	// False only after a complete successful flush, including directory sync.
+	needs_persist: bool,
 }
 
 impl LeafSet {
@@ -70,6 +72,7 @@ impl LeafSet {
 		}
 
 		Ok(LeafSet {
+			needs_persist: true,
 			path: file_path.to_path_buf(),
 			bitmap_bak: bitmap.clone(),
 			bitmap,
@@ -102,6 +105,7 @@ impl LeafSet {
 		);
 
 		let mut leaf_set = LeafSet {
+			needs_persist: true,
 			path: path.as_ref().to_path_buf(),
 			bitmap_bak: bitmap.clone(),
 			bitmap,
@@ -235,16 +239,32 @@ impl LeafSet {
 
 	/// Flush the leaf_set to file.
 	pub fn flush(&mut self) -> io::Result<()> {
+		self.flush_with(|path, bitmap| {
+			save_via_temp_file(path, ".tmp", |file| {
+				file.write_all(&bitmap.serialize::<Portable>())
+			})
+		})
+	}
+
+	fn flush_with(
+		&mut self,
+		persist: impl FnOnce(&Path, &Bitmap) -> io::Result<()>,
+	) -> io::Result<()> {
+		if !self.needs_persist && self.bitmap == self.bitmap_bak {
+			return Ok(());
+		}
+		// Retain this on every failure, including a failure after rename.
+		// Discard must not make an uncertain on-disk state look clean.
+		self.needs_persist = true;
 		// First run the optimization step on the bitmap.
 		self.bitmap.run_optimize();
 
 		// Write the updated bitmap file to disk.
-		save_via_temp_file(&self.path, ".tmp", |file| {
-			file.write_all(&self.bitmap.serialize::<Portable>())
-		})?;
+		persist(&self.path, &self.bitmap)?;
 
 		// Make sure our backup in memory is up to date.
 		self.bitmap_bak = self.bitmap.clone();
+		self.needs_persist = false;
 
 		Ok(())
 	}
@@ -354,8 +374,90 @@ mod tests {
 	use std::fs;
 
 	#[test]
+	fn flush_persists_creation_changes_and_rewind_but_skips_unchanged() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("leaf");
+		let mut leaves = LeafSet::open_or_create(&path).unwrap();
+		leaves.flush().unwrap();
+		assert!(LeafSet::open(&path).unwrap().bitmap.is_empty());
+		leaves
+			.flush_with(|_, _| panic!("unchanged bitmap written"))
+			.unwrap();
+		leaves.add(0).unwrap();
+		leaves.add(1).unwrap();
+		leaves.flush().unwrap();
+		assert_eq!(LeafSet::open(&path).unwrap().bitmap, Bitmap::of(&[1, 2]));
+		leaves.add(3).unwrap();
+		leaves.discard();
+		leaves
+			.flush_with(|_, _| panic!("discarded mutation written"))
+			.unwrap();
+		leaves.rewind(1, &Bitmap::new()).unwrap();
+		leaves.flush().unwrap();
+		assert_eq!(LeafSet::open(&path).unwrap().bitmap, Bitmap::of(&[1]));
+		leaves.remove(0).unwrap();
+		leaves.flush().unwrap();
+		assert!(LeafSet::open(&path).unwrap().bitmap.is_empty());
+	}
+
+	#[test]
+	fn flush_failure_retries_before_and_after_file_replacement() {
+		for replaced in [false, true] {
+			for discard in [false, true] {
+				let dir = mwc_crates::tempfile::tempdir().unwrap();
+				let path = dir.path().join("leaf");
+				let mut leaves = LeafSet::open_or_create(&path).unwrap();
+				leaves.add(0).unwrap();
+				leaves.flush().unwrap();
+				leaves.add(1).unwrap();
+				assert!(
+					leaves
+						.flush_with(|path, bitmap| {
+							if replaced {
+								save_via_temp_file(path, ".tmp", |f| {
+									f.write_all(&bitmap.serialize::<Portable>())
+								})?;
+							}
+							Err(io::Error::other("injected persistence failure"))
+						})
+						.is_err()
+				);
+				if discard {
+					leaves.discard();
+				}
+				leaves.flush().unwrap();
+				let expected = if discard {
+					Bitmap::of(&[1])
+				} else {
+					Bitmap::of(&[1, 2])
+				};
+				assert_eq!(LeafSet::open(&path).unwrap().bitmap, expected);
+				leaves
+					.flush_with(|_, _| panic!("successful retry still dirty"))
+					.unwrap();
+			}
+		}
+	}
+
+	#[test]
+	fn snapshot_copy_replaces_existing_different_bitmap() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("leaf");
+		let snapshot = dir.path().join("snapshot");
+		let mut leaves = LeafSet::open_or_create(&path).unwrap();
+		leaves.add(0).unwrap();
+		leaves.flush().unwrap();
+		let mut saved = LeafSet::open_or_create(&snapshot).unwrap();
+		saved.add(1).unwrap();
+		saved.flush().unwrap();
+		LeafSet::copy_snapshot(&path, &snapshot).unwrap();
+		assert_eq!(LeafSet::open(&path).unwrap().bitmap, Bitmap::of(&[2]));
+	}
+
+	#[test]
 	fn rewind_filters_invalid_restore_positions() {
 		let mut leaf_set = LeafSet {
+			needs_persist: true,
 			path: PathBuf::new(),
 			bitmap: Bitmap::of(&vec![1, 2, 4, 5, 8]),
 			bitmap_bak: Bitmap::new(),
@@ -378,6 +480,7 @@ mod tests {
 	#[test]
 	fn add_rejects_non_leaf_position() {
 		let mut leaf_set = LeafSet {
+			needs_persist: true,
 			path: PathBuf::new(),
 			bitmap: Bitmap::new(),
 			bitmap_bak: Bitmap::new(),
@@ -395,6 +498,7 @@ mod tests {
 	#[test]
 	fn remove_reports_removed_and_missing_leaf_positions() {
 		let mut leaf_set = LeafSet {
+			needs_persist: true,
 			path: PathBuf::new(),
 			bitmap: Bitmap::of(&[1]),
 			bitmap_bak: Bitmap::new(),
@@ -461,6 +565,7 @@ mod tests {
 		let temp_dir = mwc_crates::tempfile::tempdir().unwrap();
 		let path = temp_dir.path().join("leaf.bin");
 		let leaf_set = LeafSet {
+			needs_persist: true,
 			path: path.clone(),
 			bitmap: Bitmap::new(),
 			bitmap_bak: Bitmap::new(),

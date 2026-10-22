@@ -295,8 +295,11 @@ where
 		let mut res: HashSet<PeerAddr> = HashSet::new();
 
 		// first let's clean up stale requests...
+		// saturating_duration_since + >= so a request that sat 30s with no body
+		// cannot stick in_flight forever (elapsed() left timed_out=0 on iOS).
+		let now = Instant::now();
 		requested.retain(|_, request_data| {
-			if request_data.request_time.elapsed() > expiration_time_interval {
+			if now.saturating_duration_since(request_data.request_time) >= expiration_time_interval {
 				sync_peers
 					.report_no_response(&request_data.peer, request_data.request_message.clone());
 				res.insert(request_data.peer.clone());
@@ -349,6 +352,21 @@ where
 
 	pub fn has_request(&self, req: &K) -> bool {
 		self.requested.read_recursive().contains_key(req)
+	}
+
+	/// Bounded read-only diagnostic snapshot; ages retain original registration time.
+	pub fn diagnostic_requests(&self, now: Instant) -> Vec<(K, PeerAddr, Duration)> where K: Clone {
+		self.requested.read_recursive().iter().map(|(key, request)| {
+			(key.clone(), request.peer.clone(), now.saturating_duration_since(request.request_time))
+		}).collect()
+	}
+
+	/// Observation only: does not clear the request or update scheduling latency.
+	pub fn request_age_at(&self, req: &K, peer: &PeerAddr, arrived: Instant) -> Option<Duration> {
+		let requests = self.requested.read_recursive();
+		let request = requests.get(req)?;
+		if &request.peer != peer { return None; }
+		Some(arrived.saturating_duration_since(request.request_time))
 	}
 
 	pub fn get_update_requests_to_next_ask(&self) -> usize {
@@ -408,6 +426,17 @@ where
 	}
 
 	/// Cancel obsolete requests without treating them as responses or timeouts.
+	/// The predicate must establish that the exact hash no longer needs fetching.
+	/// Run lookups outside tracker locks; on lookup error leave all requests intact.
+	pub fn cancel_satisfied_requests<E>(&self, mut satisfied: impl FnMut(&K) -> Result<bool, E>) -> Result<usize, E>
+	where K: Clone {
+		let keys: Vec<K> = self.requested.read_recursive().keys().cloned().collect();
+		let mut done = Vec::new();
+		for key in keys { if satisfied(&key)? { done.push(key); } }
+		Ok(self.cancel_requests(done.iter()))
+	}
+
+	/// Cancel obsolete requests without treating them as responses or timeouts.
 	pub fn cancel_requests<'a, I>(&self, keys: I) -> usize
 	where
 		K: 'a,
@@ -447,10 +476,17 @@ where
 	}
 
 	pub fn remove_request_by_key(&self, key: &K, peer: &PeerAddr) -> Option<PeerAddr> {
+		self.remove_request_by_key_with_age(key, peer).map(|(owner, _)| owner)
+	}
+
+	/// Atomically retire one registration and return its owner and elapsed age.
+	/// Alternate delivery does not contribute to the shared latency estimator.
+	pub fn remove_request_by_key_with_age(&self, key: &K, peer: &PeerAddr) -> Option<(PeerAddr, Duration)> {
 		let mut requested = self.requested.write();
 		let peers_stats = &mut self.peers_stats.write();
 
 		if let Some(request_data) = requested.remove(key) {
+			let age = request_data.request_time.elapsed();
 			let res_peer = request_data.peer.clone();
 			Self::decrement_peer_requests(peers_stats, &res_peer);
 			if request_data.peer == *peer {
@@ -458,7 +494,7 @@ where
 					.unwrap_or(i64::MAX / 15);
 				self.latency_tracker.write().add_latency(latency_ms);
 			}
-			Some(res_peer)
+			Some((res_peer, age))
 		} else {
 			None
 		}
@@ -609,10 +645,86 @@ mod tests {
 	}
 
 	#[test]
+	fn diagnostic_snapshot_preserves_requests_and_latency() {
+		let tracker = RequestTracker::<u64>::new();
+		assert!(tracker.diagnostic_requests(Instant::now()).is_empty());
+		let peer = peer_for_idx(1);
+		tracker.register_request(42, peer.clone(), "request".into());
+		let sent = tracker.requested.read().get(&42).unwrap().request_time;
+		assert_eq!(tracker.diagnostic_requests(sent + Duration::from_secs(12)), vec![(42, peer.clone(), Duration::from_secs(12))]);
+		assert_eq!(tracker.diagnostic_requests(sent - Duration::from_millis(1))[0].2, Duration::ZERO);
+		assert_eq!(tracker.get_requests_num(), 1);
+		assert_eq!(tracker.get_expected_peer(&42), Some(peer));
+		assert_eq!(tracker.get_average_latency(), None);
+		assert_eq!(tracker.requested.read().get(&42).unwrap().request_time, sent);
+	}
+
+	#[test]
 	fn empty_latency_history_has_no_average() {
 		let tracker = LatencyTracker::new();
 
 		assert_eq!(tracker.get_average_latency(), None);
+	}
+
+	#[test]
+	fn satisfied_cleanup_only_cancels_exact_stored_keys_without_peer_penalty() {
+		let tracker = RequestTracker::<u64>::new();
+		let peer = peer_for_idx(1);
+		tracker.register_request(41, peer.clone(), "stored by replay".into());
+		tracker.register_request(42, peer.clone(), "still missing on new branch".into());
+		let cleared = tracker.cancel_satisfied_requests(|key| Ok::<_, ()>(*key == 41)).unwrap();
+		assert_eq!(cleared, 1);
+		assert!(!tracker.has_request(&41));
+		assert!(tracker.has_request(&42));
+		assert_eq!(tracker.get_peer_track_data(&peer).unwrap().requests, 1);
+		assert_eq!(tracker.get_average_latency(), None);
+	}
+
+	#[test]
+	fn satisfied_cleanup_lookup_error_keeps_all_requests() {
+		let tracker = RequestTracker::<u64>::new();
+		for key in [41, 42] { tracker.register_request(key, peer_for_idx(1), "pending".into()); }
+		let mut lookups = 0;
+		let result = tracker.cancel_satisfied_requests(|_| {
+			lookups += 1;
+			if lookups == 2 { Err("read failed") } else { Ok(true) }
+		});
+		assert_eq!(result, Err("read failed"));
+		assert_eq!(tracker.get_requests_num(), 2);
+		assert_eq!(tracker.get_average_latency(), None);
+	}
+
+	#[test]
+	fn alternate_acceptance_clears_original_but_late_rejection_does_not_clear_replacement() {
+		let tracker = RequestTracker::<u64>::new();
+		let original = peer_for_idx(1);
+		let alternate = peer_for_idx(2);
+		tracker.register_request(42, original.clone(), "blocking".into());
+		// Rescue does not replace registration; invalid alternate data cannot clear it.
+		tracker.remove_request(&42, &alternate);
+		assert!(tracker.has_request(&42));
+		assert_eq!(tracker.remove_request_by_key(&42, &alternate), Some(original.clone()));
+		assert_eq!(tracker.get_requests_num(), 0);
+		assert_eq!(tracker.get_average_latency(), None);
+		tracker.register_request(42, alternate.clone(), "new registration after timeout".into());
+		tracker.remove_request(&42, &original);
+		assert_eq!(tracker.get_expected_peer(&42), Some(alternate));
+	}
+
+	#[test]
+	fn observing_arrival_does_not_complete_or_retime_request() {
+		let tracker = RequestTracker::<u64>::new();
+		let peer = peer_for_idx(1);
+		tracker.register_request(42, peer.clone(), "request".into());
+		let sent = tracker.requested.read().get(&42).unwrap().request_time;
+		let arrived = sent + Duration::from_millis(123);
+		assert_eq!(tracker.request_age_at(&42, &peer, arrived), Some(Duration::from_millis(123)));
+		assert_eq!(tracker.request_age_at(&42, &peer_for_idx(2), arrived), None);
+		assert_eq!(tracker.request_age_at(&43, &peer, arrived), None);
+		assert!(tracker.has_request(&42));
+		assert_eq!(tracker.get_requests_num(), 1);
+		assert_eq!(tracker.get_average_latency(), None);
+		assert_eq!(tracker.requested.read().get(&42).unwrap().request_time, sent);
 	}
 
 	#[test]
@@ -690,6 +802,17 @@ mod tests {
 			selection,
 			QuorumSelection::NeedMoreResponses { responses: 1 }
 		);
+	}
+
+	#[test]
+	fn slow_startup_responses_survive_eight_fast_responses() {
+		// Reproduce the observed stale shared estimate without changing policy.
+		let mut tracker = LatencyTracker::new();
+		for _ in 0..7 { tracker.add_latency(24_000); }
+		for _ in 0..8 { tracker.add_latency(120); }
+		assert_eq!(tracker.get_average_latency(), Some(Duration::from_millis(11_264)));
+		for _ in 0..7 { tracker.add_latency(120); }
+		assert_eq!(tracker.get_average_latency(), Some(Duration::from_millis(120)));
 	}
 
 	#[test]
@@ -807,6 +930,25 @@ mod tests {
 	}
 
 	#[test]
+	fn retired_request_age_is_atomic_and_only_returned_once() {
+		let tracker = RequestTracker::<u64>::new();
+		let original = peer_for_idx(1);
+		let alternate = peer_for_idx(2);
+		tracker.register_request(42, original.clone(), "original".into());
+		tracker.requested.write().get_mut(&42).unwrap().request_time = Instant::now() - Duration::from_secs(2);
+		let (owner, age) = tracker.remove_request_by_key_with_age(&42, &alternate).unwrap();
+		assert_eq!(owner, original);
+		assert!(age >= Duration::from_secs(2));
+		assert!(tracker.remove_request_by_key_with_age(&42, &alternate).is_none());
+		assert_eq!(tracker.get_requests_num(), 0);
+		assert_eq!(tracker.get_average_latency(), None);
+		tracker.register_request(42, original.clone(), "new registration".into());
+		tracker.requested.write().get_mut(&42).unwrap().request_time = Instant::now() - Duration::from_millis(100);
+		assert_eq!(tracker.remove_request_by_key_with_age(&42, &original).unwrap().0, original);
+		assert!(tracker.get_average_latency().is_some());
+	}
+
+	#[test]
 	fn rollback_request_removes_matching_registration_without_latency() {
 		let tracker = RequestTracker::<u64>::new();
 		let peer = peer_for_idx(1);
@@ -876,6 +1018,26 @@ mod tests {
 		assert_eq!(expired, std::collections::HashSet::from([peer.clone()]));
 		assert_eq!(tracker.get_requests_num(), 0);
 		assert!(tracker.get_peer_track_data(&peer).is_none());
+	}
+
+	#[test]
+	fn request_sitting_30s_with_no_body_is_force_expired() {
+		let tracker = RequestTracker::<u64>::new();
+		let peer = peer_for_idx(1);
+		tracker.register_request(42, peer.clone(), "request".into());
+		tracker
+			.requested
+			.write()
+			.get_mut(&42)
+			.expect("request")
+			.request_time = Instant::now()
+			.checked_sub(Duration::from_secs(pibd_params::PIBD_REQUESTS_TIMEOUT_SECS as u64))
+			.expect("valid request time");
+
+		assert_eq!(tracker.get_requests_num(), 1);
+		let expired = tracker.retain_expired(pibd_params::PIBD_REQUESTS_TIMEOUT_SECS, &SyncPeers::new());
+		assert_eq!(expired, std::collections::HashSet::from([peer.clone()]));
+		assert_eq!(tracker.get_requests_num(), 0);
 	}
 
 	#[test]

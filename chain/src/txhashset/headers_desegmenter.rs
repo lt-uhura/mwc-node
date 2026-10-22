@@ -719,6 +719,13 @@ impl<T: Clone> HeadersRecieveCache<T> {
 
 	/// Apply cache to the chain. Return true if more data is available
 	pub fn apply_cache(&self) -> Result<bool, (Option<T>, Error)> {
+		if self.chain.storage_writes_frozen() {
+			self.chain.note_storage_map_full("headers_desegmenter apply_cache");
+			return Err((
+				None,
+				Error::Other("LMDB map is full; restart the node to grow the map".into()),
+			));
+		}
 		// Apply data from cache if possible
 		let mut headers_all: Vec<BlockHeader> = Vec::new();
 		let mut headers_by_peer: Vec<(u64, Vec<BlockHeader>, T)> = Vec::new();
@@ -825,6 +832,10 @@ impl<T: Clone> HeadersRecieveCache<T> {
 					self.remove_cached_header_batches(&applied_heights);
 				}
 				Err(e) => {
+					if e.is_lmdb_map_full() {
+						self.chain.note_storage_map_full("add_headers bulk MAP_FULL");
+						return Err((None, e));
+					}
 					warn!(
 						"add_headers in bulk is failed, will add one by one. Error: {}",
 						e
@@ -844,6 +855,12 @@ impl<T: Clone> HeadersRecieveCache<T> {
 						match self.chain.sync_block_headers(&hdr, tip, Options::NONE) {
 							Ok(_) => self.remove_cached_header_batches(&[height]),
 							Err(e) => {
+								if e.is_lmdb_map_full() {
+									self.chain.note_storage_map_full(
+										"add_headers one-by-one MAP_FULL",
+									);
+									return Err((None, e));
+								}
 								let bad_data = e.is_bad_data();
 								let err = if bad_data { (Some(peer), e) } else { (None, e) };
 

@@ -31,6 +31,31 @@ use mwc_store::{option_to_not_found, to_key, to_key_u64, Error};
 use std::convert::{TryFrom, TryInto};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use mwc_crates::parking_lot::Mutex;
+
+// Optional local policy, not a network consensus checkpoint or validation shortcut.
+const LOCAL_CHECKPOINT_KEY: &[u8] = b"J:local_checkpoint_v1";
+const ROLLING_CHECKPOINT_DEPTH_KEY: &[u8] = b"J:rolling_checkpoint_depth_v1";
+const CHECKPOINT_CONFLICT_FILE: &str = "local_checkpoint.conflict";
+
+fn remove_checkpoint_conflict_file(path: &std::path::Path) -> Result<(), Error> {
+	match std::fs::remove_file(path) {
+		Ok(()) => std::fs::File::open(path.parent().unwrap()).and_then(|dir| dir.sync_all())
+			.map_err(|e| Error::OtherErr(format!("Local checkpoint cannot sync pause removal: {}", e))),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+		Err(e) => Err(Error::OtherErr(format!("Local checkpoint cannot remove pause: {}", e))),
+	}
+}
+
+#[derive(Default)]
+struct CheckpointCache {
+	verified: Mutex<HashMap<(Hash, Hash), BlockHeader>>,
+	conflict: AtomicBool,
+	conflict_persisted: AtomicBool,
+	update: Mutex<()>,
+	conflict_path: std::path::PathBuf,
+}
 
 const STORE_SUBPATH: &str = "chain";
 
@@ -95,13 +120,85 @@ pub(crate) fn blocks_equal_as_v3(
 /// All chain-related database operations
 pub struct ChainStore {
 	db: mwc_store::Store,
+	checkpoint_cache: Arc<CheckpointCache>,
 }
 
 impl ChainStore {
+	/// Explicit recovery action, ONLY before opening Chain and while holding the
+	/// server's exclusive data-directory lock. Removes policy, never chain records.
+	pub fn clear_local_checkpoint_before_open(context_id: u32, db_root: &str) -> Result<(), Error> {
+		let db = mwc_store::Store::new(context_id, db_root, None, Some(STORE_SUBPATH), None)?;
+		let batch = db.batch_write()?;
+		if batch.get_ser::<Tip>(LOCAL_CHECKPOINT_KEY)?.is_some() {
+			batch.delete(LOCAL_CHECKPOINT_KEY)?;
+		}
+		if batch.get_ser::<u64>(ROLLING_CHECKPOINT_DEPTH_KEY)?.is_some() {
+			batch.delete(ROLLING_CHECKPOINT_DEPTH_KEY)?;
+		}
+		batch.commit()?;
+		remove_checkpoint_conflict_file(&std::path::Path::new(db_root).join(CHECKPOINT_CONFLICT_FILE))
+	}
+
+	/// Whether this environment is waiting for a safe reopen.
+	pub fn writes_frozen(&self) -> bool {
+		self.db.writes_frozen()
+	}
+
+	/// Record map exhaustion without affecting another node environment.
+	pub fn note_map_full(&self, context: &str) {
+		self.db.note_map_full(context);
+	}
+
 	/// Create new chain store
 	pub fn new(context_id: u32, db_root: &str) -> Result<ChainStore, Error> {
 		let db = mwc_store::Store::new(context_id, db_root, None, Some(STORE_SUBPATH), None)?;
-		Ok(ChainStore { db })
+		let conflict_path = std::path::Path::new(db_root).join(CHECKPOINT_CONFLICT_FILE);
+		let conflict = conflict_path.try_exists().map_err(|e| Error::OtherErr(format!("Local checkpoint pause status: {}", e)))?;
+		let store = ChainStore { db, checkpoint_cache: Arc::new(CheckpointCache {
+			conflict: AtomicBool::new(conflict), conflict_persisted: AtomicBool::new(conflict),
+			conflict_path, ..CheckpointCache::default()
+		}) };
+		// Fail closed before migrations/recovery if an older binary changed the
+		// selected history while ignoring the optional policy record.
+		{
+			let batch = store.batch_read()?;
+			if batch.rolling_checkpoint_depth()?.is_some() && batch.local_checkpoint()?.is_none() {
+				return Err(Error::OtherErr("Local checkpoint rolling policy is missing its anchor".into()));
+			}
+			if batch.local_checkpoint()?.is_some() {
+				batch.validate_checkpoint_tip(&batch.head()?)?;
+				batch.validate_checkpoint_tip(&batch.header_head()?)?;
+			}
+		}
+		Ok(store)
+	}
+
+	/// User-selected fixed local checkpoint, if enabled.
+	pub fn local_checkpoint(&self) -> Result<Option<Tip>, Error> {
+		self.db.get_ser(LOCAL_CHECKPOINT_KEY)
+	}
+
+	/// Whether a competing history has been rejected in this process.
+	pub fn local_checkpoint_conflict(&self) -> bool {
+		self.checkpoint_cache.conflict.load(Ordering::Relaxed)
+	}
+
+	/// None means fixed/off; a positive depth enables monotonic rolling advancement.
+	pub fn rolling_checkpoint_depth(&self) -> Result<Option<u64>, Error> {
+		self.db.get_ser(ROLLING_CHECKPOINT_DEPTH_KEY)
+	}
+
+	/// Serialize policy commits against newly observed conflicts. Take after DB locks.
+	pub(crate) fn checkpoint_update_lock(&self) -> mwc_crates::parking_lot::MutexGuard<'_, ()> {
+		self.checkpoint_cache.update.lock()
+	}
+
+	/// Explicit user reset only; call while holding checkpoint_update_lock.
+	pub(crate) fn clear_checkpoint_conflict(&self) -> Result<(), Error> {
+		remove_checkpoint_conflict_file(&self.checkpoint_cache.conflict_path)?;
+		self.checkpoint_cache.conflict.store(false, Ordering::SeqCst);
+		self.checkpoint_cache.conflict_persisted.store(false, Ordering::SeqCst);
+		Ok(())
 	}
 
 	/// The current chain head.
@@ -180,6 +277,7 @@ impl ChainStore {
 	pub fn batch_read(&self) -> Result<Batch<'_>, Error> {
 		Ok(Batch {
 			db: self.db.batch_read()?,
+			checkpoint_cache: self.checkpoint_cache.clone(),
 		})
 	}
 
@@ -187,6 +285,7 @@ impl ChainStore {
 	pub fn batch_write(&self) -> Result<Batch<'_>, Error> {
 		Ok(Batch {
 			db: self.db.batch_write()?,
+			checkpoint_cache: self.checkpoint_cache.clone(),
 		})
 	}
 
@@ -232,10 +331,18 @@ impl ChainStore {
 
 	/// Clear the durable pending chain operation marker.
 	pub fn clear_pending_chain_operation(&self) -> Result<(), Error> {
-		let batch = self.batch_write()?;
+		let batch = Batch { db: self.db.batch_write_cleanup()?, checkpoint_cache: self.checkpoint_cache.clone() };
 		batch.delete_chain_marker(ChainMarker::LastChainOperation)?;
 		batch.commit()?;
 		Ok(())
+	}
+
+	/// Whether any full block other than genesis is retained.
+	pub(crate) fn has_full_blocks_above_genesis(
+		&self,
+		genesis_hash: &Hash,
+	) -> Result<bool, Error> {
+		self.batch_read()?.has_full_blocks_above_genesis(genesis_hash)
 	}
 }
 
@@ -244,9 +351,102 @@ impl ChainStore {
 pub struct Batch<'a> {
 	/// The underlying db instance.
 	pub db: mwc_store::Batch<'a>,
+	checkpoint_cache: Arc<CheckpointCache>,
 }
 
 impl<'a> Batch<'a> {
+	/// Read rolling depth in the same transaction as the checkpoint anchor.
+	pub fn rolling_checkpoint_depth(&self) -> Result<Option<u64>, Error> {
+		self.db.get_ser(ROLLING_CHECKPOINT_DEPTH_KEY)
+	}
+
+	pub(crate) fn set_rolling_checkpoint_depth(&self, depth: Option<u64>) -> Result<(), Error> {
+		match depth {
+			Some(0) => Err(Error::OtherErr("Rolling checkpoint depth must be positive".into())),
+			Some(depth) => self.db.put_ser(ROLLING_CHECKPOINT_DEPTH_KEY, &depth),
+			None => Self::ignore_not_found(self.db.delete(ROLLING_CHECKPOINT_DEPTH_KEY)),
+		}
+	}
+	/// Read the optional fixed policy in this transaction.
+	pub fn local_checkpoint(&self) -> Result<Option<Tip>, Error> {
+		self.db.get_ser(LOCAL_CHECKPOINT_KEY)
+	}
+
+	pub(crate) fn set_local_checkpoint(&self, checkpoint: Option<&Tip>) -> Result<(), Error> {
+		match checkpoint {
+			Some(tip) => self.db.put_ser(LOCAL_CHECKPOINT_KEY, tip)?,
+			None => Self::ignore_not_found(self.db.delete(LOCAL_CHECKPOINT_KEY))?,
+		}
+		self.checkpoint_cache.verified.lock().clear();
+		Ok(())
+	}
+
+	/// Enforce exact checkpoint ancestry, including persisted forks and recovery.
+	/// A matching ancestor below the checkpoint is allowed for replay, but no
+	/// alternative prefix is. This never bypasses ordinary block/PoW validation.
+	pub fn validate_checkpoint_header(&self, header: &BlockHeader) -> Result<(), Error> {
+		let Some(pin) = self.local_checkpoint()? else { return Ok(()); };
+		let context = self.get_context_id();
+		let candidate_hash = header.hash(context)?;
+		let cache_key = (pin.last_block_h, candidate_hash);
+		// MWC's header hash is proof-derived. Match the COMPLETE header before
+		// reusing ancestry, even on paths that authenticate its PoW later.
+		if self.checkpoint_cache.verified.lock().get(&cache_key) == Some(header) { return Ok(()); }
+		let mut visited = HashSet::new();
+		let mut current = if header.height < pin.height {
+			crate::checked_header_by_hash(context, &pin.last_block_h, "local checkpoint", |h| self.get_block_header(h))
+				.map_err(|e| Error::OtherErr(e.to_string()))?
+		} else { header.clone() };
+		let target_height = header.height.min(pin.height);
+		let target_hash = if header.height < pin.height { candidate_hash } else { pin.last_block_h };
+		loop {
+			let hash = current.hash(context)?;
+			if current.height == target_height {
+				if hash != target_hash {
+					// A sidecar avoids opening a nested LMDB writer from read-only or
+					// already-writing validation paths. Its existence is the durable latch.
+					let _update = self.checkpoint_cache.update.lock();
+					self.checkpoint_cache.conflict.store(true, Ordering::SeqCst);
+					if !self.checkpoint_cache.conflict_persisted.load(Ordering::SeqCst) {
+					let path = &self.checkpoint_cache.conflict_path;
+					let file = std::fs::OpenOptions::new().write(true).create(true).open(path)
+						.map_err(|e| Error::OtherErr(format!("Local checkpoint cannot persist conflict pause: {}", e)))?;
+					file.sync_all().and_then(|_| std::fs::File::open(path.parent().unwrap()).and_then(|dir| dir.sync_all()))
+						.map_err(|e| Error::OtherErr(format!("Local checkpoint cannot sync conflict pause: {}", e)))?;
+					self.checkpoint_cache.conflict_persisted.store(true, Ordering::SeqCst);
+					}
+					return Err(Error::OtherErr(format!("Local checkpoint conflict: history must include block {} ({})", pin.height, pin.last_block_h)));
+				}
+				break;
+			}
+			if current.height < target_height {
+				return Err(Error::OtherErr("Local checkpoint ancestry has an invalid height".into()));
+			}
+			if header.height >= pin.height && self.checkpoint_cache.verified.lock().get(&(pin.last_block_h, hash)) == Some(&current) {
+				break;
+			}
+			current = crate::checked_previous_header(context, &current, &mut visited,
+				"local checkpoint", |h| self.get_block_header(h))
+				.map_err(|e| Error::OtherErr(e.to_string()))?;
+		}
+		// Bounded, store-instance-local ancestry memoization. Keyed by the exact
+		// pin as well as the candidate; no stale policy survives replacement.
+		let mut cache = self.checkpoint_cache.verified.lock();
+		if cache.len() >= 1024 { cache.clear(); }
+		cache.insert(cache_key, header.clone());
+		Ok(())
+	}
+
+	fn validate_checkpoint_tip(&self, tip: &Tip) -> Result<(), Error> {
+		if self.local_checkpoint()?.is_none() { return Ok(()); }
+		let header = crate::checked_header_by_hash(self.get_context_id(), &tip.last_block_h,
+			"local checkpoint tip", |h| self.get_block_header(h))
+			.map_err(|e| Error::OtherErr(e.to_string()))?;
+		if header.height != tip.height {
+			return Err(Error::OtherErr("Local checkpoint tip height mismatch".into()));
+		}
+		self.validate_checkpoint_header(&header)
+	}
 	fn ignore_not_found(result: Result<(), Error>) -> Result<(), Error> {
 		match result {
 			Ok(()) => Ok(()),
@@ -284,6 +484,7 @@ impl<'a> Batch<'a> {
 
 	/// Save body head to db.
 	pub fn save_body_head(&self, t: &Tip) -> Result<(), Error> {
+		self.validate_checkpoint_tip(t)?;
 		self.db.put_ser(&[HEAD_PREFIX], t)
 	}
 
@@ -299,6 +500,7 @@ impl<'a> Batch<'a> {
 
 	/// Save header head to db.
 	pub fn save_header_head(&self, t: &Tip) -> Result<(), Error> {
+		self.validate_checkpoint_tip(t)?;
 		self.db.put_ser(&[HEADER_HEAD_PREFIX], t)
 	}
 
@@ -322,6 +524,24 @@ impl<'a> Batch<'a> {
 	/// Whether any persisted full-block records exist.
 	pub(crate) fn has_any_full_blocks(&self) -> Result<bool, Error> {
 		self.has_any_prefixed_records(BLOCK_PREFIX)
+	}
+
+	/// Whether any full block other than genesis is retained.
+	/// Key scan only (no block deserialization) so archive nodes stay cheap.
+	pub(crate) fn has_full_blocks_above_genesis(
+		&self,
+		genesis_hash: &Hash,
+	) -> Result<bool, Error> {
+		let prefix = to_key(BLOCK_PREFIX, "");
+		let genesis_key = to_key(BLOCK_PREFIX, genesis_hash);
+		let mut entries = self.db.iter(&prefix, |k, _| Ok(k.to_vec()))?;
+		for entry in &mut entries {
+			let key = entry?;
+			if key != genesis_key {
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	fn has_any_prefixed_records(&self, record_prefix: u8) -> Result<bool, Error> {
@@ -381,6 +601,7 @@ impl<'a> Batch<'a> {
 	/// enforces exact identity with the separately stored complete header and
 	/// preserves any canonical full body already stored under the block hash.
 	pub fn save_block(&self, b: &Block) -> Result<(), Error> {
+		self.validate_checkpoint_header(&b.header)?;
 		let block_hash = b.hash(self.get_context_id())?;
 		let stored_header = self.get_block_header(&block_hash)?;
 		if stored_header != b.header {
@@ -700,6 +921,7 @@ impl<'a> Batch<'a> {
 
 	/// Save block header to db.
 	pub fn save_block_header(&self, header: &BlockHeader) -> Result<(), Error> {
+		self.validate_checkpoint_header(header)?;
 		let hash = header.hash(self.get_context_id())?;
 		// Defense in depth for local persistence. This is not a cryptographic
 		// collision check: normal PoW validation is what binds the complete header
@@ -1009,6 +1231,7 @@ impl<'a> Batch<'a> {
 	pub fn child(&mut self) -> Result<Batch<'_>, Error> {
 		Ok(Batch {
 			db: self.db.child()?,
+			checkpoint_cache: self.checkpoint_cache.clone(),
 		})
 	}
 

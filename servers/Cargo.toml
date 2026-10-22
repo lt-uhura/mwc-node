@@ -10,7 +10,7 @@ workspace = ".."
 edition = "2024"
 
 [dependencies]
-mwc_crates = { path = "../mwc_crates", version = "7.1.0" }
+mwc_crates = { path = "../mwc_crates", version = "7.1.0", default-features = false }
 mwc_api = { path = "../api", version = "7.1.0" }
 mwc_chain = { path = "../chain", version = "7.1.0" }
 mwc_core = { path = "../core", version = "7.1.0" }
@@ -24,6 +24,7 @@ thiserror.workspace = true
 [features]
 default = []
 test-support = [
+	"mwc_p2p/test-support",
 	"mwc_api/test-support",
 	"mwc_chain/test-support",
 	"mwc_core/test-support",

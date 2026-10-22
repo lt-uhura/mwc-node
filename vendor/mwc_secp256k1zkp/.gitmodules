@@ -1,0 +1,4 @@
+[submodule "depend/secp256k1-zkp"]
+	path = depend/secp256k1-zkp
+	url = https://github.com/mwcproject/secp256k1-zkp
+	branch = master

@@ -373,6 +373,30 @@ fn empty_block_with_coinbase_is_valid() {
 }
 
 #[test]
+fn preverified_proofs_do_not_bypass_signature_or_coinbase_checks() {
+	test_setup();
+	let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+	let keychain = ExtKeychain::from_seed(&secp, &SecretKey::new(&secp, &mut SysRng).unwrap().0, false).unwrap();
+	let builder = ProofBuilder::new(&secp, &keychain).unwrap();
+	let prev = BlockHeader::default(0);
+	let blocks: Vec<_> = (1..=2).map(|n| {
+		let key_id = ExtKeychain::derive_key_id(1, n, 0, 0, 0).unwrap();
+		new_block(&[], &keychain, &builder, &prev, &key_id)
+	}).collect();
+	Block::preverify_sync_proofs(&blocks, &mut secp);
+	for b in &blocks { b.validate(0, &BlindingFactor::zero(), &mut secp).unwrap(); }
+	let mut changed = blocks[0].clone();
+	changed.body.kernels[0].excess_sig = blocks[1].body.kernels[0].excess_sig;
+	assert!(changed.validate(0, &BlindingFactor::zero(), &mut secp).is_err());
+	let mut changed = blocks[0].clone();
+	changed.body.outputs[0].identifier.features = OutputFeatures::Plain;
+	assert!(changed.validate(0, &BlindingFactor::zero(), &mut secp).is_err());
+	let mut changed = blocks[0].clone();
+	changed.body.outputs[0].proof.proof[10] ^= 1;
+	assert!(changed.validate(0, &BlindingFactor::zero(), &mut secp).is_err());
+}
+
+#[test]
 // test that flipping the COINBASE flag on the output features
 // invalidates the block and specifically it causes verify_coinbase to fail
 // additionally verifying the merkle_inputs_outputs also fails

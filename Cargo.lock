@@ -3850,7 +3850,6 @@ dependencies = [
 [[package]]
 name = "mwc_secp256k1zkp"
 version = "0.8.0"
-source = "git+https://github.com/mwcproject/rust-secp256k1-zkp?tag=0.8.0#ddb7ae905c34c12df11087bc602727969c2e3838"
 dependencies = [
  "arrayvec 0.7.8",
  "cc",

@@ -16,26 +16,53 @@
 //! Storage of core types using LMDB.
 
 use mwc_crates::lmdb_zero;
-use mwc_crates::lmdb_zero::traits::CreateCursor;
 use mwc_crates::lmdb_zero::LmdbResultExt;
+use mwc_crates::lmdb_zero::traits::CreateCursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "ios"))]
 use std::time::Duration;
 
 use crate::Error::NotFoundErr;
+#[cfg(not(target_os = "ios"))]
 use mwc_core::global;
 use mwc_core::ser::{self, ProtocolVersion};
-use mwc_crates::log::{debug, info, trace};
+#[cfg(not(target_os = "ios"))]
+use mwc_crates::log::info;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+use mwc_crates::log::warn;
+use mwc_crates::log::{debug, trace};
 use mwc_crates::parking_lot::{RwLock, RwLockReadGuard};
 
 /// number of bytes to grow the database by when needed
 pub const ALLOC_CHUNK_SIZE_DEFAULT: usize = 134_217_728; //128 MB
 /// And for test mode, to avoid too much disk allocation on windows
 pub const ALLOC_CHUNK_SIZE_DEFAULT_TEST: usize = 1_048_576; //1 MB
+/// iOS small-store / first-run mapsize (peerV2, empty chain is distinguished by path).
+/// Chain env opens at existing+1GB. Runtime remap stays disabled —
+/// grow only at Store::new, never during body sync.
+#[cfg(target_os = "ios")]
+const ALLOC_CHUNK_SIZE_IOS: usize = ALLOC_CHUNK_SIZE_DEFAULT; // 128 MB
+/// Chain-store open headroom. Never treat ~10MB as enough; never open the
+/// chain env at 128MB when data.mdb is already ~120MB.
+#[cfg(any(target_os = "ios", test))]
+const IOS_CHAIN_OPEN_HEADROOM: usize = 1024 * 1024 * 1024; // 1 GB
+/// If data.mdb is larger than this, treat as chain even if the path is unusual.
+/// peerV2 is excluded by path and never gets this policy.
+#[cfg(any(target_os = "ios", test))]
+const IOS_CHAIN_EXISTING_THRESHOLD: usize = 32 * 1024 * 1024; // 32 MB
+/// Arithmetic/address-range guard, not an assumed device allocation limit.
+/// Actual requests stay bounded by existing size + 1 GiB; the OS decides what
+/// fits. Align down for iOS pages and stay within signed pointer range.
+#[cfg(any(target_os = "ios", test))]
+const IOS_MAPSIZE_CAP: usize = (isize::MAX as usize) & !(16 * 1024 - 1);
 const RESIZE_PERCENT_NUMERATOR: usize = 9;
 const RESIZE_PERCENT_DENOMINATOR: usize = 10;
 /// Want to ensure that each resize gives us at least this %
 /// of total space free
+#[cfg(not(target_os = "ios"))]
 const RESIZE_MIN_TARGET_PERCENT_NUMERATOR: usize = 65;
+#[cfg(not(target_os = "ios"))]
 const RESIZE_MIN_TARGET_PERCENT_DENOMINATOR: usize = 100;
 
 /// Main error type for this lmdb
@@ -81,6 +108,30 @@ impl Error {
 			_ => false,
 		}
 	}
+
+	/// LMDB map-full (including iOS runtime-remap-disabled errors).
+	pub fn is_lmdb_map_full(&self) -> bool {
+		if let Error::LmdbErr(lmdb_zero::error::Error::Code(code)) = self {
+			if *code == lmdb_zero::error::MAP_FULL {
+				return true;
+			}
+		}
+		let s = self.to_string();
+		s.contains("LMDB map is full")
+			|| s.contains("MDB_MAP_FULL")
+			|| s.contains("MapFull")
+			|| s.contains("restart the node to grow the map")
+	}
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+fn is_chain_store_path(full_path: &str) -> bool {
+	let p = full_path.replace('\\', "/");
+	let trimmed = p.trim_end_matches('/');
+	if trimmed.ends_with("/peerV2") || trimmed.contains("/peerV2/") {
+		return false;
+	}
+	trimmed.ends_with("/lmdb")
 }
 
 /// unwraps the inner option by converting the none case to a not found error
@@ -153,21 +204,374 @@ fn resize_threshold_exceeded(
 	Ok(lhs > rhs)
 }
 
+fn alloc_chunk_size_for(context_id: u32) -> usize {
+	#[cfg(target_os = "ios")]
+	{
+		let _ = context_id;
+		ALLOC_CHUNK_SIZE_IOS
+	}
+	#[cfg(not(target_os = "ios"))]
+	{
+		if global::is_production_mode(context_id) {
+			ALLOC_CHUNK_SIZE_DEFAULT
+		} else {
+			ALLOC_CHUNK_SIZE_DEFAULT_TEST
+		}
+	}
+}
+
+fn open_lmdb_env(
+	full_path: &str,
+	mapsize: usize,
+	max_readers: Option<u32>,
+) -> Result<lmdb_zero::Environment, Error> {
+	let mut env_builder = lmdb_zero::EnvBuilder::new()?;
+	env_builder.set_maxdbs(8)?;
+	if let Some(mr) = max_readers {
+		env_builder.set_maxreaders(mr)?;
+	}
+	env_builder.set_mapsize(mapsize)?;
+	let env = unsafe { env_builder.open(full_path, lmdb_zero::open::NOTLS, 0o600)? };
+	Ok(env)
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_cap_mapsize(mapsize: usize) -> usize {
+	mapsize.min(IOS_MAPSIZE_CAP)
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn lmdb_error_is_enomem(e: &Error) -> bool {
+	matches!(e, Error::LmdbErr(lmdb_zero::error::Error::Code(code))
+		if *code == mwc_crates::libc::ENOMEM)
+}
+
+/// Chain vs small store:
+///   path is peerV2                         → small (128MB → 64 → 32)
+///   path ends with the chain env (`/lmdb`) → chain
+///   existing > 32MB and not peerV2         → chain
+///
+/// Chain open mapsize:
+///   existing + 1GB, bounded by representable address range
+/// One open is the grow. Never init-reopen at 7GB. Never open the chain
+/// env at 128MB when existing is already ~120MB.
+///
+/// ENOMEM fallbacks go SMALLER only. peerV2 never retries 1GB/6GB.
+#[cfg(any(target_os = "ios", test))]
+fn ios_is_peer_v2_path(full_path: &str) -> bool {
+	let p = full_path.replace('\\', "/");
+	let trimmed = p.trim_end_matches('/');
+	trimmed.ends_with("/peerV2") || trimmed.contains("/peerV2/")
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_is_chain_env(full_path: &str, existing_size: usize) -> bool {
+	if ios_is_peer_v2_path(full_path) {
+		return false;
+	}
+	let p = full_path.replace('\\', "/");
+	let trimmed = p.trim_end_matches('/');
+	trimmed.ends_with("/lmdb") || existing_size > IOS_CHAIN_EXISTING_THRESHOLD
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_open_mapsize(full_path: &str, existing_size: usize) -> usize {
+	if ios_is_chain_env(full_path, existing_size) {
+		ios_cap_mapsize(existing_size.saturating_add(IOS_CHAIN_OPEN_HEADROOM))
+	} else {
+		ios_cap_mapsize(existing_size.saturating_add(ALLOC_CHUNK_SIZE_DEFAULT))
+	}
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_open_candidates(full_path: &str, existing_size: usize) -> Vec<usize> {
+	let primary = ios_open_mapsize(full_path, existing_size);
+	let mut candidates = Vec::new();
+	if primary >= existing_size {
+		candidates.push(primary);
+	}
+	if ios_is_chain_env(full_path, existing_size) {
+		// Descending, bounded retries on ENOMEM. Keep actual writable space,
+		// rather than opening just above the desktop percentage threshold.
+		for extra in [768, 512, 256, 128] {
+			let size = ios_cap_mapsize(existing_size.saturating_add(extra * 1024 * 1024));
+			if size > existing_size && size < primary && !candidates.contains(&size) {
+				candidates.push(size);
+			}
+		}
+	} else {
+		// Small store / first-run: 128MB then 64MB then 32MB. Never 1GB/6GB.
+		for sz in [ALLOC_CHUNK_SIZE_DEFAULT / 2, ALLOC_CHUNK_SIZE_DEFAULT / 4] {
+			if sz > existing_size && sz < primary && !candidates.contains(&sz) {
+				candidates.push(sz);
+			}
+		}
+	}
+	candidates
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_map_has_write_headroom(used: usize, mapsize: usize) -> Result<bool, Error> {
+	// Desktop can remap at 90%; iOS cannot. Keep a bounded cleanup reserve
+	// instead of stranding hundreds of MB in a multi-GB fixed mapping.
+	let reserve = (mapsize / 10).min(64 * 1024 * 1024);
+	Ok(used < mapsize && mapsize - used >= reserve)
+}
+
+#[cfg(target_os = "ios")]
+fn open_lmdb_env_ios(
+	full_path: &str,
+	existing_size: usize,
+	max_readers: Option<u32>,
+) -> Result<lmdb_zero::Environment, Error> {
+	let candidates = ios_open_candidates(full_path, existing_size);
+
+	if candidates.is_empty() {
+		return Err(Error::OtherErr(format!(
+			"LMDB address-range limit reached at {} (data.mdb={} bytes, maximum representable map={} bytes). Existing data retained; a larger supported mapping is required, not a resync.",
+			full_path, existing_size, IOS_MAPSIZE_CAP
+		)));
+	}
+	let mut last_err = None;
+	for mapsize in candidates {
+		match open_lmdb_env(full_path, mapsize, max_readers) {
+			Ok(env) => {
+				let info = env.info()?;
+				let stat = env.stat()?;
+				let used = lmdb_size_used_bytes(stat.psize as usize, info.last_pgno)?;
+				if !ios_map_has_write_headroom(used, info.mapsize)? {
+					return Err(Error::OtherErr(format!(
+						"LMDB mapping has insufficient write headroom at {} (used={}, map={}). Existing data retained; more supported address space is required.",
+						full_path, used, info.mapsize
+					)));
+				}
+				warn!(
+					"iOS LMDB opened {} with map={}, used={}, free={}; live remap disabled; write reserve capped at 64 MiB",
+					full_path, info.mapsize, used, info.mapsize - used
+				);
+				return Ok(env);
+			}
+			Err(e) => {
+				// Smaller mappings can address ENOMEM, not corruption, permissions,
+				// or a full disk. Never hide those errors by retrying.
+				if !lmdb_error_is_enomem(&e) {
+					return Err(e);
+				}
+				warn!(
+					"iOS LMDB map={} unavailable for {}: {}",
+					mapsize, full_path, e
+				);
+				last_err = Some(e);
+			}
+		}
+	}
+	Err(Error::OtherErr(format!(
+		"Unable to map existing LMDB at {} (data.mdb={} bytes); data retained; last error: {:?}",
+		full_path, existing_size, last_err
+	)))
+}
+
 const DEFAULT_DB_VERSION: ProtocolVersion = ProtocolVersion(3);
+
+#[cfg(test)]
+mod restart_tests {
+	use super::*;
+
+	#[test]
+	fn ios_retries_only_native_address_space_exhaustion() {
+		let native = |code| Error::LmdbErr(lmdb_zero::error::Error::Code(code));
+		assert!(lmdb_error_is_enomem(&native(mwc_crates::libc::ENOMEM)));
+		assert!(!lmdb_error_is_enomem(&native(mwc_crates::libc::ENOSPC)));
+		assert!(!lmdb_error_is_enomem(&native(mwc_crates::libc::EACCES)));
+		assert!(!lmdb_error_is_enomem(&native(lmdb_zero::error::CORRUPTED)));
+		assert!(!lmdb_error_is_enomem(&Error::OtherErr(
+			"ENOMEM in an unrelated message".into()
+		)));
+	}
+
+	#[test]
+	fn ios_large_archive_fallback_has_usable_headroom() {
+		let used = 3 * 1024 * 1024 * 1024;
+		let candidates = ios_open_candidates("/archive/lmdb", used);
+		assert_eq!(candidates.len(), 5);
+		assert!(candidates[0] > candidates[1]);
+		for size in candidates {
+			assert!(size <= IOS_MAPSIZE_CAP);
+			assert!(ios_map_has_write_headroom(used, size).unwrap());
+		}
+	}
+
+	#[test]
+	fn ios_peer_store_grows_from_existing_size_and_keeps_small_fallbacks() {
+		assert_eq!(
+			ios_open_candidates("/archive/peerV2", 0),
+			vec![128 * 1024 * 1024, 64 * 1024 * 1024, 32 * 1024 * 1024]
+		);
+		let used = 120 * 1024 * 1024;
+		let candidates = ios_open_candidates("/archive/peerV2", used);
+		assert_eq!(candidates, vec![used + ALLOC_CHUNK_SIZE_DEFAULT]);
+		assert!(ios_map_has_write_headroom(used, candidates[0]).unwrap());
+	}
+
+	#[test]
+	fn ios_ceiling_never_selects_mapping_smaller_than_existing_file() {
+		assert!(ios_open_candidates("/archive/lmdb", IOS_MAPSIZE_CAP + 1).is_empty());
+		assert!(ios_open_candidates("/archive/lmdb", usize::MAX).is_empty());
+		assert_eq!(
+			ios_open_candidates("/archive/lmdb", IOS_MAPSIZE_CAP),
+			vec![IOS_MAPSIZE_CAP]
+		);
+		assert!(!ios_map_has_write_headroom(IOS_MAPSIZE_CAP, IOS_MAPSIZE_CAP).unwrap());
+	}
+
+	#[test]
+	fn ios_archive_mapping_grows_beyond_old_six_gib_ceiling() {
+		let gib = 1024 * 1024 * 1024;
+		for used in [5_478_465_536, 6 * gib, 7 * gib, 25 * gib, 64 * gib] {
+			let candidates = ios_open_candidates("/archive/lmdb", used);
+			assert_eq!(candidates[0], used + gib);
+			assert_eq!(candidates.len(), 5);
+			assert!(candidates.windows(2).all(|pair| pair[0] > pair[1]));
+			for map in candidates {
+				assert!(map > used);
+				assert!(map <= used + gib);
+				assert!(ios_map_has_write_headroom(used, map).unwrap());
+			}
+		}
+	}
+
+	#[test]
+	fn ios_headroom_matches_write_threshold_at_boundary() {
+		assert!(ios_map_has_write_headroom(90, 100).unwrap());
+		assert!(!ios_map_has_write_headroom(91, 100).unwrap());
+		assert!(!ios_map_has_write_headroom(0, 0).unwrap());
+		assert!(!ios_map_has_write_headroom(101, 100).unwrap());
+	}
+
+	#[test]
+	fn ios_reported_device_map_keeps_real_write_headroom() {
+		let used = 5_032_001_536;
+		let map = 5_624_667_249;
+		assert!(ios_map_has_write_headroom(used, map).unwrap());
+		assert!(ios_map_has_write_headroom(map - 64 * 1024 * 1024, map).unwrap());
+		assert!(!ios_map_has_write_headroom(map - 64 * 1024 * 1024 + 1, map).unwrap());
+		for candidate in ios_open_candidates("/archive/lmdb", used) {
+			assert!(candidate - used >= 128 * 1024 * 1024);
+		}
+	}
+
+	#[test]
+	fn ios_small_mapping_headroom_uses_actual_lmdb_pages() {
+		let root = mwc_crates::tempfile::tempdir().unwrap();
+		let env = open_lmdb_env(root.path().to_str().unwrap(), 32 * 1024 * 1024, None).unwrap();
+		let info = env.info().unwrap();
+		let stat = env.stat().unwrap();
+		let used = lmdb_size_used_bytes(stat.psize as usize, info.last_pgno).unwrap();
+		assert!(ios_map_has_write_headroom(used, info.mapsize).unwrap());
+	}
+
+	#[test]
+	fn frozen_environment_views_share_state_but_reopen_preserves_data_and_unfreezes() {
+		mwc_core::global::set_local_chain_type(mwc_core::global::ChainTypes::AutomatedTesting);
+		let root = mwc_crates::tempfile::tempdir().unwrap();
+		let path = root.path().to_str().unwrap();
+		{
+			let store = Store::new(0, path, None, None, None).unwrap();
+			let batch = store.batch_write().unwrap();
+			batch.put_ser(b"committed", &42u64).unwrap();
+			batch.commit().unwrap();
+			let view = store.with_version(0, DEFAULT_DB_VERSION);
+			store.note_map_full("regression");
+			assert!(store.writes_frozen());
+			assert!(view.writes_frozen());
+			assert!(matches!(store.batch_write(), Err(ref e) if e.is_lmdb_map_full()));
+			assert!(matches!(view.batch_write(), Err(ref e) if e.is_lmdb_map_full()));
+			assert!(matches!(store.batch_write_cleanup(), Err(ref e) if e.is_lmdb_map_full()));
+			let independent = Store::new(0, path, Some("independent"), None, None).unwrap();
+			assert!(!independent.writes_frozen());
+		}
+		{
+			let reopened = Store::new(0, path, None, None, None).unwrap();
+			assert!(!reopened.writes_frozen());
+			assert_eq!(reopened.get_ser::<u64>(b"committed").unwrap(), Some(42));
+			let batch = reopened.batch_write().unwrap();
+			batch.put_ser(b"next", &43u64).unwrap();
+			batch.commit().unwrap();
+			assert_eq!(reopened.get_ser::<u64>(b"next").unwrap(), Some(43));
+		}
+	}
+
+	#[test]
+	fn recognizes_native_map_full_code() {
+		assert!(
+			Error::LmdbErr(lmdb_zero::error::Error::Code(lmdb_zero::error::MAP_FULL))
+				.is_lmdb_map_full()
+		);
+		assert!(
+			!Error::LmdbErr(lmdb_zero::error::Error::Code(lmdb_zero::error::NOTFOUND))
+				.is_lmdb_map_full()
+		);
+	}
+
+	#[test]
+	fn cleanup_batch_deletes_marker_without_losing_committed_data() {
+		mwc_core::global::set_local_chain_type(mwc_core::global::ChainTypes::AutomatedTesting);
+		let root = mwc_crates::tempfile::tempdir().unwrap();
+		let store = Store::new(0, root.path().to_str().unwrap(), None, None, None).unwrap();
+		let batch = store.batch_write().unwrap();
+		batch.put_ser(b"committed", &42u64).unwrap();
+		batch.put_ser(b"marker", &1u64).unwrap();
+		batch.commit().unwrap();
+		let cleanup = store.batch_write_cleanup().unwrap();
+		cleanup.delete(b"marker").unwrap();
+		cleanup.commit().unwrap();
+		assert_eq!(store.get_ser::<u64>(b"marker").unwrap(), None);
+		assert_eq!(store.get_ser::<u64>(b"committed").unwrap(), Some(42));
+	}
+}
 
 /// LMDB-backed store facilitating data access and serialization. All writes
 /// are done through a Batch abstraction providing atomicity.
 pub struct Store {
-	env: Arc<lmdb_zero::Environment>,
+	env: Arc<RwLock<Option<Arc<lmdb_zero::Environment>>>>,
 	db: Arc<RwLock<Option<Arc<lmdb_zero::Database<'static>>>>>,
 	resize_lock: Arc<RwLock<()>>,
+	// Shared by views of this environment, never by a newly opened node.
+	writes_frozen: Arc<AtomicBool>,
 	name: String,
 	version: ProtocolVersion,
 	alloc_chunk_size: usize,
 	context_id: u32,
+	full_path: String,
+	max_readers: Option<u32>,
 }
 
 impl Store {
+	/// Whether this environment must be closed and reopened before writing.
+	pub fn writes_frozen(&self) -> bool {
+		self.writes_frozen.load(Ordering::SeqCst)
+	}
+
+	/// Freeze only this environment; reopening creates a fresh write state.
+	pub fn note_map_full(&self, context: &str) {
+		#[cfg(any(target_os = "ios", target_os = "android", test))]
+		if !self.writes_frozen.swap(true, Ordering::SeqCst) {
+			mwc_crates::log::warn!(
+				"LMDB writes frozen until restart ({}): {}",
+				self.full_path,
+				context
+			);
+		}
+		#[cfg(not(any(target_os = "ios", target_os = "android", test)))]
+		let _ = context;
+	}
+
+	fn get_env(&self) -> Result<Arc<lmdb_zero::Environment>, Error> {
+		self.env.read_recursive().as_ref().cloned().ok_or_else(|| {
+			Error::DbUnavailable("LMDB environment unavailable during resize".into())
+		})
+	}
+
 	/// Create a new LMDB env under the provided directory.
 	/// By default creates an environment named "lmdb".
 	/// Be aware of transactional semantics in lmdb
@@ -193,35 +597,50 @@ impl Store {
 		let full_path = [root_path.to_owned(), name].join("/");
 		prepare_lmdb_env_dir(&full_path)?;
 
-		let mut env_builder = lmdb_zero::EnvBuilder::new()?;
-		env_builder.set_maxdbs(8)?;
+		let alloc_chunk_size = alloc_chunk_size_for(context_id);
 
-		if let Some(max_readers) = max_readers {
-			env_builder.set_maxreaders(max_readers)?;
-		}
+		// Size the initial mmap from the existing data.mdb so we avoid
+		// runtime resizes whose mmap remap crashes iOS. Each LMDB store
+		// gets its own mapsize:
+		//   chain (`.../lmdb` or existing > 32MB, not peerV2) → existing+1GB
+		//   peerV2 / small                                   → 128MB (64/32 fallback)
+		// No init-reopen. Runtime do_resize stays disabled. Never wipe.
+		let data_mdb = format!("{}/data.mdb", full_path);
+		let existing_size = std::fs::metadata(&data_mdb)
+			.map(|m| m.len() as usize)
+			.unwrap_or(0);
 
-		let alloc_chunk_size = match global::is_production_mode(context_id) {
-			true => ALLOC_CHUNK_SIZE_DEFAULT,
-			false => ALLOC_CHUNK_SIZE_DEFAULT_TEST,
+		#[cfg(target_os = "ios")]
+		let env = open_lmdb_env_ios(&full_path, existing_size, max_readers)?;
+		#[cfg(not(target_os = "ios"))]
+		let env = {
+			let initial_mapsize = if existing_size > alloc_chunk_size {
+				existing_size + 2 * 1024 * 1024 * 1024
+			} else {
+				alloc_chunk_size
+			};
+			open_lmdb_env(&full_path, initial_mapsize, max_readers)?
 		};
 
-		let env = unsafe { env_builder.open(&full_path, lmdb_zero::open::NOTLS, 0o600)? };
-
 		debug!("DB Mapsize for {} is {}", full_path, env.info()?.mapsize);
+		let env = Arc::new(env);
 		let res = Store {
-			env: Arc::new(env),
+			env: Arc::new(RwLock::new(Some(env.clone()))),
 			db: Arc::new(RwLock::new(None)),
 			resize_lock: Arc::new(RwLock::new(())),
+			writes_frozen: Arc::new(AtomicBool::new(false)),
 			name: db_name,
 			version: DEFAULT_DB_VERSION,
 			alloc_chunk_size,
 			context_id,
+			full_path,
+			max_readers,
 		};
 
 		{
 			let mut w = res.db.write();
 			*w = Some(Arc::new(lmdb_zero::Database::open(
-				res.env.clone(),
+				env,
 				Some(&res.name),
 				&lmdb_zero::DatabaseOptions::new(lmdb_zero::db::CREATE),
 			)?));
@@ -232,18 +651,18 @@ impl Store {
 	/// Construct a new store using a specific protocol version.
 	/// Permits access to the db with legacy protocol versions for db migrations.
 	pub fn with_version(&self, context_id: u32, version: ProtocolVersion) -> Store {
-		let alloc_chunk_size = match global::is_production_mode(context_id) {
-			true => ALLOC_CHUNK_SIZE_DEFAULT,
-			false => ALLOC_CHUNK_SIZE_DEFAULT_TEST,
-		};
+		let alloc_chunk_size = alloc_chunk_size_for(context_id);
 		Store {
 			env: self.env.clone(),
 			db: self.db.clone(),
 			resize_lock: self.resize_lock.clone(),
+			writes_frozen: self.writes_frozen.clone(),
 			name: self.name.clone(),
 			version,
 			alloc_chunk_size,
 			context_id,
+			full_path: self.full_path.clone(),
+			max_readers: self.max_readers,
 		}
 	}
 
@@ -264,19 +683,21 @@ impl Store {
 		if w.is_some() {
 			return Ok(());
 		}
+		let env = self.get_env()?;
 		*w = Some(Arc::new(lmdb_zero::Database::open(
-			self.env.clone(),
+			env,
 			Some(&self.name),
 			&lmdb_zero::DatabaseOptions::new(lmdb_zero::db::CREATE),
 		)?));
 		Ok(())
 	}
 
-	/// Determines whether the environment needs a resize based on a simple percentage threshold
+	/// Checks the fixed-map cleanup reserve on iOS and percentage threshold elsewhere.
 	pub fn needs_resize(&self) -> Result<bool, Error> {
 		let _resize_guard = self.resize_lock.read_recursive();
-		let env_info = self.env.info()?;
-		let stat = self.env.stat()?;
+		let env = self.get_env()?;
+		let env_info = env.info()?;
+		let stat = env.stat()?;
 
 		let size_used = lmdb_size_used_bytes(stat.psize as usize, env_info.last_pgno)?;
 		trace!("DB map size: {}", env_info.mapsize);
@@ -295,12 +716,16 @@ impl Store {
 			RESIZE_PERCENT_DENOMINATOR
 		);
 
+		#[cfg(target_os = "ios")]
+		return Ok(!ios_map_has_write_headroom(size_used, env_info.mapsize)?);
+
+		#[cfg(not(target_os = "ios"))]
 		if resize_threshold_exceeded(
 			size_used,
 			env_info.mapsize,
 			RESIZE_PERCENT_NUMERATOR,
 			RESIZE_PERCENT_DENOMINATOR,
-		)? || env_info.mapsize < self.alloc_chunk_size
+		)? || (!cfg!(target_os = "ios") && env_info.mapsize < self.alloc_chunk_size)
 		{
 			trace!("Resize threshold met (percent-based)");
 			Ok(true)
@@ -313,63 +738,94 @@ impl Store {
 	/// Increments the database size by as many ALLOC_CHUNK_SIZES
 	/// to give a minimum threshold of free space
 	pub fn do_resize(&self) -> Result<(), Error> {
-		// Do active waiting for write with try lock, because write() lock will block next read
-		// locks that can make a deadlock. Active write lock waiting should be fine
-		let _resize_guard = loop {
-			match self.resize_lock.try_write() {
-				Some(l) => break l,
-				None => {
-					std::thread::sleep(Duration::from_millis(25));
-					continue;
-				}
-			}
-		};
-		let env_info = self.env.info()?;
-		let stat = self.env.stat()?;
-		let size_used = lmdb_size_used_bytes(stat.psize as usize, env_info.last_pgno)?;
-
-		let new_mapsize = if env_info.mapsize < self.alloc_chunk_size {
-			self.alloc_chunk_size
-		} else {
-			let mut tot = env_info.mapsize;
-			while resize_threshold_exceeded(
-				size_used,
-				tot,
-				RESIZE_MIN_TARGET_PERCENT_NUMERATOR,
-				RESIZE_MIN_TARGET_PERCENT_DENOMINATOR,
-			)? {
-				tot = tot.checked_add(self.alloc_chunk_size).ok_or_else(|| {
-					Error::OtherErr(format!(
-						"LMDB resize overflow, current mapsize={}, alloc_chunk_size={}",
-						tot, self.alloc_chunk_size
-					))
-				})?;
-			}
-			tot
-		};
-
-		// Note: Intentionally closing and None DB during resize.
-		// If resize failed, none of DB will be opened, so any db access will fails.
-		// It is expected behavior, we can't keep using prev instance because it is almost full
-		// and performance is degrading. We need to do resize of fail.
-		let mut w = self.db.write();
-		*w = None;
-
-		unsafe {
-			self.env.set_mapsize(new_mapsize)?;
+		// Runtime set_mapsize / close+reopen does munmap+mmap, which crashes
+		// iOS when any thread later creates a read transaction. Grow the map
+		// only at open/create; fail the write so the Swift layer can ask for
+		// a node restart.
+		#[cfg(target_os = "ios")]
+		{
+			return Err(Error::OtherErr(
+				"LMDB runtime remap is disabled on iOS; restart the node to grow the map".into(),
+			));
 		}
 
-		*w = Some(Arc::new(lmdb_zero::Database::open(
-			self.env.clone(),
-			Some(&self.name),
-			&lmdb_zero::DatabaseOptions::new(lmdb_zero::db::CREATE),
-		)?));
+		#[cfg(not(target_os = "ios"))]
+		{
+			// Do active waiting for write with try lock, because write() lock will block next read
+			// locks that can make a deadlock. Active write lock waiting should be fine
+			let _resize_guard = loop {
+				match self.resize_lock.try_write() {
+					Some(l) => break l,
+					None => {
+						std::thread::sleep(Duration::from_millis(25));
+						continue;
+					}
+				}
+			};
+			let env = self.get_env()?;
+			let env_info = env.info()?;
+			let stat = env.stat()?;
+			let size_used = lmdb_size_used_bytes(stat.psize as usize, env_info.last_pgno)?;
 
-		info!(
-			"Resized database from {} to {}",
-			env_info.mapsize, new_mapsize
-		);
-		Ok(())
+			let new_mapsize = if env_info.mapsize < self.alloc_chunk_size {
+				self.alloc_chunk_size
+			} else {
+				let mut tot = env_info.mapsize;
+				while resize_threshold_exceeded(
+					size_used,
+					tot,
+					RESIZE_MIN_TARGET_PERCENT_NUMERATOR,
+					RESIZE_MIN_TARGET_PERCENT_DENOMINATOR,
+				)? {
+					tot = tot.checked_add(self.alloc_chunk_size).ok_or_else(|| {
+						Error::OtherErr(format!(
+							"LMDB resize overflow, current mapsize={}, alloc_chunk_size={}",
+							tot, self.alloc_chunk_size
+						))
+					})?;
+				}
+				tot
+			};
+
+			// Close db and env completely, then reopen with the larger mapsize.
+			// The old approach called set_mapsize() in-place which does munmap+mmap —
+			// on iOS this crashes when any thread later creates a read transaction
+			// because the remapped address can be invalidated by the kernel.
+			{
+				let mut w = self.db.write();
+				*w = None;
+			}
+			drop(env);
+			{
+				let mut env_lock = self.env.write();
+				*env_lock = None;
+			}
+
+			let new_env = Arc::new(open_lmdb_env(
+				&self.full_path,
+				new_mapsize,
+				self.max_readers,
+			)?);
+
+			{
+				let mut env_lock = self.env.write();
+				*env_lock = Some(new_env.clone());
+			}
+			{
+				let mut w = self.db.write();
+				*w = Some(Arc::new(lmdb_zero::Database::open(
+					new_env,
+					Some(&self.name),
+					&lmdb_zero::DatabaseOptions::new(lmdb_zero::db::CREATE),
+				)?));
+			}
+
+			info!(
+				"Resized database from {} to {}",
+				env_info.mapsize, new_mapsize
+			);
+			Ok(())
+		}
 	}
 
 	/// Gets a value from the db, provided its key.
@@ -399,7 +855,8 @@ impl Store {
 		let db = lock
 			.as_ref()
 			.ok_or_else(|| Error::DbUnavailable("chain db is None".to_string()))?;
-		let txn = lmdb_zero::ReadTransaction::new(self.env.clone())?;
+		let env = self.get_env()?;
+		let txn = lmdb_zero::ReadTransaction::new(env)?;
 		let access = txn.access();
 		self.get_with(key, &access, &db, |_, mut data| {
 			ser::deserialize_strict(&mut data, self.protocol_version(), self.context_id)
@@ -414,7 +871,8 @@ impl Store {
 		let db = lock
 			.as_ref()
 			.ok_or_else(|| Error::DbUnavailable("chain db is None".to_string()))?;
-		let txn = lmdb_zero::ReadTransaction::new(self.env.clone())?;
+		let env = self.get_env()?;
+		let txn = lmdb_zero::ReadTransaction::new(env)?;
 		let access = txn.access();
 
 		let res: Option<&lmdb_zero::Ignore> = access.get(db, key).to_opt()?;
@@ -435,7 +893,8 @@ impl Store {
 		let db = lock
 			.as_ref()
 			.ok_or_else(|| Error::DbUnavailable("chain db is None".to_string()))?;
-		let tx = Arc::new(lmdb_zero::ReadTransaction::new(self.env.clone())?);
+		let env = self.get_env()?;
+		let tx = Arc::new(lmdb_zero::ReadTransaction::new(env)?);
 		let cursor = tx.cursor(db.clone())?;
 		Ok(PrefixIterator::new_owned_read(
 			tx,
@@ -449,7 +908,8 @@ impl Store {
 	/// Builds a new read only batch to be used with this store.
 	pub fn batch_read(&self) -> Result<Batch<'_>, Error> {
 		let resize_guard = self.resize_lock.read_recursive();
-		let tx = lmdb_zero::ReadTransaction::new(self.env.clone())?;
+		let env = self.get_env()?;
+		let tx = lmdb_zero::ReadTransaction::new(env)?;
 		Ok(Batch {
 			store: self,
 			tx_w: None,
@@ -460,18 +920,72 @@ impl Store {
 
 	/// Builds a new batch with write access to be used with this store.
 	pub fn batch_write(&self) -> Result<Batch<'_>, Error> {
+		self.batch_write_internal(false)
+	}
+
+	/// Only for completing an already committed operation's recovery marker.
+	/// On iOS this uses reserved capacity without remapping. It never bypasses
+	/// a MAP_FULL freeze or native transaction/commit failure.
+	pub fn batch_write_cleanup(&self) -> Result<Batch<'_>, Error> {
+		self.batch_write_internal(cfg!(any(target_os = "ios", test)))
+	}
+
+	fn batch_write_internal(&self, cleanup: bool) -> Result<Batch<'_>, Error> {
+		if self.writes_frozen() {
+			return Err(Error::OtherErr(
+				"LMDB map is full; restart the node to grow the map".into(),
+			));
+		}
 		// check if the db needs resizing before returning the batch
-		if self.needs_resize()? {
-			self.do_resize()?;
+		if !cleanup && self.needs_resize()? {
+			#[cfg(target_os = "ios")]
+			{
+				if is_chain_store_path(&self.full_path) {
+					self.note_map_full(&format!("batch_write needs_resize {}", self.full_path));
+				} else {
+					warn!(
+						"LMDB map is full for {}; restart the node to grow the map (runtime remap is disabled on iOS)",
+						self.full_path
+					);
+				}
+				return Err(Error::OtherErr(
+					"LMDB map is full; restart the node to grow the map".into(),
+				));
+			}
+			#[cfg(not(target_os = "ios"))]
+			{
+				self.do_resize()?;
+			}
 		}
 		let resize_guard = self.resize_lock.read_recursive();
-		let tx = lmdb_zero::WriteTransaction::new(self.env.clone())?;
+		let env = self.get_env()?;
+		let tx = match lmdb_zero::WriteTransaction::new(env) {
+			Ok(tx) => tx,
+			Err(e) => {
+				let err: Error = e.into();
+				self.maybe_freeze_on_map_full(&err);
+				return Err(err);
+			}
+		};
 		Ok(Batch {
 			store: self,
 			tx_w: Some(tx),
 			tx_r: None,
 			_resize_guard: Some(resize_guard),
 		})
+	}
+
+	fn maybe_freeze_on_map_full(&self, err: &Error) {
+		#[cfg(any(target_os = "ios", target_os = "android"))]
+		{
+			if is_chain_store_path(&self.full_path) && err.is_lmdb_map_full() {
+				self.note_map_full(&format!("lmdb write {}", self.full_path));
+			}
+		}
+		#[cfg(not(any(target_os = "ios", target_os = "android")))]
+		{
+			let _ = err;
+		}
 	}
 }
 
@@ -492,7 +1006,12 @@ impl<'a> Batch<'a> {
 			.ok_or_else(|| Error::DbUnavailable("chain db is None".to_string()))?;
 		if let Some(tx) = &self.tx_w {
 			tx.access()
-				.put(db, key, value, lmdb_zero::put::Flags::empty())?;
+				.put(db, key, value, lmdb_zero::put::Flags::empty())
+				.map_err(|e| {
+					let err: Error = e.into();
+					self.store.maybe_freeze_on_map_full(&err);
+					err
+				})?;
 			Ok(())
 		} else {
 			return Err(Error::BatchTypeError(
@@ -652,7 +1171,11 @@ impl<'a> Batch<'a> {
 			.as_ref()
 			.ok_or_else(|| Error::DbUnavailable("chain db is None".to_string()))?;
 		if let Some(tx) = &self.tx_w {
-			tx.access().del_key(db, key)?;
+			tx.access().del_key(db, key).map_err(|e| {
+				let err: Error = e.into();
+				self.store.maybe_freeze_on_map_full(&err);
+				err
+			})?;
 			Ok(())
 		} else {
 			Err(Error::BatchTypeError(
@@ -663,8 +1186,14 @@ impl<'a> Batch<'a> {
 
 	/// Writes the batch to db
 	pub fn commit(self) -> Result<(), Error> {
+		let mut timing = mwc_util::sync_diagnostics::Metric::LmdbCommit.start();
 		if let Some(tx) = self.tx_w {
-			tx.commit()?;
+			tx.commit().map_err(|e| {
+				let err: Error = e.into();
+				self.store.maybe_freeze_on_map_full(&err);
+				err
+			})?;
+			timing.success();
 			Ok(())
 		} else {
 			Err(Error::BatchTypeError(

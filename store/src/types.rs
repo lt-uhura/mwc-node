@@ -21,12 +21,26 @@ use mwc_core::ser::{
 	self, BinWriter, ProtocolVersion, Readable, Reader, StreamingReader, Writeable, Writer,
 };
 use mwc_crates::log::debug;
+use mwc_crates::parking_lot::Mutex;
+use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, ErrorKind, Seek, SeekFrom, Write};
 use std::marker;
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+// A single read-ahead page per file, independent of archive or session size.
+// Large records bypass this cache. The OS supplies its own reclaimable file cache.
+const READ_CACHE_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+struct ReadCache {
+	offset: u64,
+	bytes: Vec<u8>,
+}
 
 fn ser_error_to_io(context: &str, err: ser::Error) -> io::Error {
 	io::Error::new(io::ErrorKind::Other, format!("{}, {}", context, err))
@@ -307,6 +321,9 @@ pub struct AppendOnlyFile<T> {
 	buffer: Vec<u8>,
 	buffer_start_pos: u64,
 	buffer_start_pos_bak: Option<u64>,
+	// iOS uses positional I/O so file growth and rewinds never remap live memory.
+	positional_io: bool,
+	read_cache: Mutex<ReadCache>,
 	parent_dir_needs_sync: bool,
 	_marker: marker::PhantomData<T>,
 }
@@ -315,7 +332,7 @@ impl<T> AppendOnlyFile<T>
 where
 	T: Debug + Readable + Writeable,
 {
-	/// Open a file (existing or not) as append-only, backed by a mmap.
+	/// Open a file (existing or not) with buffered appends and platform-specific reads.
 	pub fn open<P>(
 		path: P,
 		size_info: SizeInfo,
@@ -362,6 +379,8 @@ where
 			buffer: vec![],
 			buffer_start_pos: 0,
 			buffer_start_pos_bak: None,
+			positional_io: cfg!(any(target_os = "ios", feature = "test-ios-storage")),
+			read_cache: Mutex::new(ReadCache::default()),
 			parent_dir_needs_sync: false,
 			_marker: marker::PhantomData,
 		};
@@ -400,15 +419,19 @@ where
 		}
 
 		let (file, created) = open_existing_or_create_regular_file(&self.path, |options| {
-			options.read(true).append(true);
+			options.read(true).write(true);
 		})?;
 		self.parent_dir_needs_sync |= created;
 
-		// If we have a non-empty file then mmap it.
-		if self.size()? == 0 {
+		self.mmap = None;
+		*self.read_cache.get_mut() = ReadCache::default();
+		let file_len = file.metadata()?.len();
+		if file_len == 0 {
 			self.buffer_start_pos = 0;
 		} else {
-			self.mmap = Some(Self::map_file(&file)?);
+			if !self.positional_io {
+				self.mmap = Some(Self::map_file(&file)?);
+			}
 			self.buffer_start_pos = self.size_in_elmts()?;
 		}
 		self.file = Some(file);
@@ -900,12 +923,21 @@ where
 		}
 	}
 
-	/// Syncs all writes (fsync), reallocating the memory map to make the newly
-	/// written data accessible.
+	/// Syncs all writes (fsync). Desktop refreshes the mapping; iOS invalidates
+	/// its bounded positional read cache without mapping the PMMR.
 	pub fn flush(&mut self) -> io::Result<()> {
+		self.flush_storage()
+	}
+
+	fn flush_storage(&mut self) -> io::Result<()> {
+		let mut timing = mwc_util::sync_diagnostics::Metric::PmmrFlush.start();
 		let buffer_start_offset = self.buffer_start_offset()?;
-		// Drop and recreate, or Windows throws an access error on set_len().
+		// Invalidate before mutation, including when persistence later fails.
 		self.mmap = None;
+		// Invalidate bytes, but retain the bounded page allocation across batches.
+		// Even a failed flush must leave no readable cached bytes. init/release
+		// still drop the allocation when the backing file is replaced or closed.
+		self.read_cache.get_mut().bytes.clear();
 		self.file = None;
 		let (mut file, created) = open_existing_or_create_regular_file(&self.path, |options| {
 			options.read(true).write(true);
@@ -918,7 +950,11 @@ where
 		file.set_len(buffer_start_offset)?;
 		file.seek(SeekFrom::Start(buffer_start_offset))?;
 		file.write_all(&self.buffer[..])?;
-		file.sync_all()?;
+		{
+			let mut sync_timing = mwc_util::sync_diagnostics::Metric::PmmrFsync.start();
+			file.sync_all()?;
+			sync_timing.success();
+		}
 		if self.parent_dir_needs_sync {
 			sync_parent_dir(&self.path)?;
 			self.parent_dir_needs_sync = false;
@@ -932,7 +968,7 @@ where
 
 		let buffer_start_pos = self.size_in_elmts()?;
 		// Note: file must be non-empty to memory map it
-		if file.metadata()?.len() == 0 {
+		if self.positional_io || file.metadata()?.len() == 0 {
 			self.mmap = None;
 		} else {
 			self.mmap = Some(Self::map_file(&file)?);
@@ -943,7 +979,59 @@ where
 		self.buffer_start_pos_bak = None;
 		self.file = Some(file);
 
+		timing.success();
 		Ok(())
+	}
+
+	// Owned results allow bounded caching without exposing references that could
+	// outlive cache replacement. Positional reads do not share a seek cursor.
+	#[cfg(unix)]
+	fn read_from_file(&self, offset: u64, length: u16) -> io::Result<Vec<u8>> {
+		let file = self.file.as_ref().ok_or_else(|| {
+			io::Error::new(
+				ErrorKind::Other,
+				"PMMR file is unavailable after a failed flush",
+			)
+		})?;
+		let len = usize::from(length);
+		let end = offset
+			.checked_add(u64::from(length))
+			.ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "PMMR read offset overflow"))?;
+		let mut cache = self.read_cache.lock();
+		if offset >= cache.offset && end <= cache.offset + cache.bytes.len() as u64 {
+			let start = (offset - cache.offset) as usize;
+			return Ok(cache.bytes[start..start + len].to_vec());
+		}
+		let page = offset / READ_CACHE_BYTES as u64 * READ_CACHE_BYTES as u64;
+		if end - page > READ_CACHE_BYTES as u64 {
+			drop(cache);
+			let mut bytes = vec![0; len];
+			file.read_exact_at(&mut bytes, offset)?;
+			return Ok(bytes);
+		}
+		let file_len = file.metadata()?.len();
+		if end > file_len {
+			return Err(io::Error::new(ErrorKind::UnexpectedEof, "short PMMR file"));
+		}
+		let read_len = (file_len - page).min(READ_CACHE_BYTES as u64) as usize;
+		// Publish only a complete successful read; an error leaves no stale page.
+		cache.bytes.clear();
+		cache.bytes.resize(read_len, 0);
+		if let Err(error) = file.read_exact_at(&mut cache.bytes, page) {
+			cache.bytes.clear();
+			return Err(error);
+		}
+		cache.offset = page;
+		let start = (offset - page) as usize;
+		Ok(cache.bytes[start..start + len].to_vec())
+	}
+
+	#[cfg(not(unix))]
+	fn read_from_file(&self, _offset: u64, _length: u16) -> io::Result<Vec<u8>> {
+		Err(io::Error::new(
+			ErrorKind::Unsupported,
+			"positional PMMR test backend requires Unix",
+		))
 	}
 
 	/// Discard the current non-flushed data.
@@ -964,14 +1052,18 @@ where
 	/// Read the bytes representing the element at the given position (0-indexed).
 	/// Uses the offset cache to determine the offset to read from and the size
 	/// in bytes to actually read.
-	/// Leverages the memory map.
-	pub fn read(&self, pos: u64) -> io::Result<Option<&[u8]>> {
+	/// Borrows desktop mapped bytes or returns an owned positional read on iOS.
+	pub fn read(&self, pos: u64) -> io::Result<Option<Cow<'_, [u8]>>> {
 		if pos >= self.size_unsync_in_elmts()? {
 			return Ok(None);
 		}
 		let (offset, length) = self.offset_and_size(pos)?;
 		let res = if pos < self.buffer_start_pos {
-			self.read_from_mmap(offset, length)?
+			if self.positional_io {
+				Cow::Owned(self.read_from_file(offset, length)?)
+			} else {
+				Cow::Borrowed(self.read_from_mmap(offset, length)?)
+			}
 		} else {
 			let (buffer_offset, _) = self.offset_and_size(self.buffer_start_pos)?;
 			let offset = offset.checked_sub(buffer_offset).ok_or_else(|| {
@@ -983,7 +1075,7 @@ where
 					),
 				)
 			})?;
-			self.read_from_buffer(offset, length)?
+			Cow::Borrowed(self.read_from_buffer(offset, length)?)
 		};
 		Ok(Some(res))
 	}
@@ -1286,6 +1378,7 @@ where
 	pub fn release(&mut self) {
 		self.mmap = None;
 		self.file = None;
+		*self.read_cache.get_mut() = ReadCache::default();
 
 		// Remember to release the size_file as well if we have one.
 		if let SizeInfo::VariableSize(size_file) = &mut self.size_info {
@@ -1495,5 +1588,196 @@ mod tests {
 			panic!("expected variable-size file");
 		};
 		assert_eq!(size_file.buffer.len(), 2 * usize::from(SizeEntry::LEN));
+	}
+
+	#[test]
+	fn positional_flush_reuses_allocation_without_reusing_cached_bytes() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("reuse.bin");
+		let mut file = AppendOnlyFile::<TestElem>::open(
+			&path, SizeInfo::FixedSize(4), ProtocolVersion(1), 0,
+			VariableSizeMetadataValidation::Full,
+		).unwrap();
+		file.positional_io = true;
+		file.append(&mut vec![1; READ_CACHE_BYTES * 2]).unwrap();
+		file.flush().unwrap();
+		file.read_from_file(READ_CACHE_BYTES as u64, 4).unwrap();
+		let allocation = file.read_cache.lock().bytes.as_ptr();
+		let capacity = file.read_cache.lock().bytes.capacity();
+		file.rewind((READ_CACHE_BYTES / 4) as u64).unwrap();
+		file.append(&mut vec![2; READ_CACHE_BYTES]).unwrap();
+		file.flush().unwrap();
+		assert!(file.read_cache.lock().bytes.is_empty());
+		assert_eq!(file.read_cache.lock().bytes.as_ptr(), allocation);
+		assert_eq!(file.read_from_file(READ_CACHE_BYTES as u64, 4).unwrap(), vec![2; 4]);
+		assert_eq!(file.read_cache.lock().bytes.as_ptr(), allocation);
+		assert_eq!(file.read_cache.lock().bytes.capacity(), capacity);
+		assert!(capacity <= READ_CACHE_BYTES);
+
+		// A failure opening the destination must also invalidate cached data.
+		file.path = dir.path().join("missing-parent").join("data.bin");
+		assert!(file.flush().is_err());
+		assert!(file.read_cache.lock().bytes.is_empty());
+		assert_eq!(file.read_cache.lock().bytes.as_ptr(), allocation);
+		assert!(file.read_from_file(READ_CACHE_BYTES as u64, 4).is_err());
+		file.path = path;
+		file.flush().unwrap();
+		assert_eq!(file.read_from_file(READ_CACHE_BYTES as u64, 4).unwrap(), vec![2; 4]);
+	}
+
+	#[test]
+	fn positional_flush_rewinds_and_rewrites_durable_bytes() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("data.bin");
+		let mut file = AppendOnlyFile::<TestElem>::open(
+			&path,
+			SizeInfo::FixedSize(4),
+			ProtocolVersion(1),
+			0,
+			VariableSizeMetadataValidation::Full,
+		)
+		.unwrap();
+		file.positional_io = true;
+		for _ in 0..4 {
+			file.append_elmt(&TestElem).unwrap();
+		}
+		file.flush().unwrap();
+		assert_eq!(file.read(1).unwrap().unwrap().as_ref(), &[0; 4]);
+		file.rewind(1).unwrap();
+		// Deliberately use different bytes to detect stale read-cache entries.
+		file.append(&mut [0, 0, 0, 7]).unwrap();
+		file.flush().unwrap();
+		assert!(file.mmap.is_none());
+		assert_eq!(file.size().unwrap(), 8);
+		assert_eq!(file.read(1).unwrap().unwrap().as_ref(), &[0, 0, 0, 7]);
+		file.rewind(1).unwrap();
+		file.flush().unwrap();
+		assert_eq!(file.size().unwrap(), 4);
+		assert!(file.read(1).unwrap().is_none());
+		drop(file);
+		let reopened = AppendOnlyFile::<TestElem>::open(
+			&path,
+			SizeInfo::FixedSize(4),
+			ProtocolVersion(1),
+			0,
+			VariableSizeMetadataValidation::Full,
+		)
+		.unwrap();
+		assert_eq!(reopened.size_in_elmts().unwrap(), 1);
+	}
+
+	#[test]
+	fn positional_cache_is_bounded_across_growth_and_discard() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("data.bin");
+		let mut file = AppendOnlyFile::<TestElem>::open(
+			&path,
+			SizeInfo::FixedSize(4),
+			ProtocolVersion(1),
+			0,
+			VariableSizeMetadataValidation::Full,
+		)
+		.unwrap();
+		file.positional_io = true;
+		for batch in 0..8 {
+			for _ in 0..8192 {
+				file.append_elmt(&TestElem).unwrap();
+			}
+			file.flush().unwrap();
+			for pos in [0, 4095, (batch + 1) * 8192 - 1] {
+				assert_eq!(file.read(pos).unwrap().unwrap().as_ref(), &[0; 4]);
+				assert!(file.read_cache.lock().bytes.capacity() <= READ_CACHE_BYTES);
+			}
+			assert!(file.buffer.is_empty());
+			assert!(file.mmap.is_none());
+		}
+		let size = file.size_in_elmts().unwrap();
+		file.rewind(1).unwrap();
+		file.append(&mut [0, 0, 0, 9]).unwrap();
+		file.discard();
+		assert_eq!(file.size_in_elmts().unwrap(), size);
+		assert_eq!(file.read(1).unwrap().unwrap().as_ref(), &[0; 4]);
+	}
+
+	#[test]
+	fn positional_read_handles_page_boundary_and_reports_short_file() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("data.bin");
+		let mut file = AppendOnlyFile::<TestElem>::open(
+			&path,
+			SizeInfo::FixedSize(4),
+			ProtocolVersion(1),
+			0,
+			VariableSizeMetadataValidation::Full,
+		)
+		.unwrap();
+		file.positional_io = true;
+		for _ in 0..8192 {
+			file.append_elmt(&TestElem).unwrap();
+		}
+		file.flush().unwrap();
+		file.read_from_file(0, 4).unwrap();
+		let cache_allocation = file.read_cache.lock().bytes.as_ptr();
+		file.read_from_file(READ_CACHE_BYTES as u64, 4).unwrap();
+		assert_eq!(cache_allocation, file.read_cache.lock().bytes.as_ptr());
+		assert_eq!(
+			file.read_from_file(READ_CACHE_BYTES as u64 - 2, 4).unwrap(),
+			vec![0; 4]
+		);
+		assert_eq!(file.read_from_file(0, 32000).unwrap().len(), 32000);
+		assert!(file.read_cache.lock().bytes.len() <= READ_CACHE_BYTES);
+		assert_eq!(
+			file.read_from_file(32767, 4).unwrap_err().kind(),
+			ErrorKind::UnexpectedEof
+		);
+	}
+
+	/// Host-only microbenchmark; includes the same durable flush as production.
+	/// This does not predict iPhone NAND latency or end-to-end block throughput.
+	#[test]
+	#[ignore]
+	fn positional_durable_append_benchmark() {
+		for round in 0..3 {
+			let dir = mwc_crates::tempfile::tempdir().unwrap();
+			let mut file = AppendOnlyFile::<TestElem>::open(
+				dir.path().join("bench.bin"), SizeInfo::FixedSize(4),
+				ProtocolVersion(1), 0, VariableSizeMetadataValidation::Full,
+			).unwrap();
+			file.positional_io = true;
+			file.append(&mut vec![0; READ_CACHE_BYTES]).unwrap();
+			file.flush().unwrap();
+			let start = std::time::Instant::now();
+			for _ in 0..250 {
+				file.read_from_file(0, 4).unwrap();
+				file.append(&mut [1; 32]).unwrap();
+				file.flush().unwrap();
+			}
+			eprintln!("positional durable append round={} iterations=250 elapsed_ms={:.3}",
+				round, start.elapsed().as_secs_f64() * 1000.0);
+			assert_eq!(file.size().unwrap(), READ_CACHE_BYTES as u64 + 250 * 32);
+		}
+	}
+
+	#[test]
+	fn positional_flush_retry_truncates_partially_written_tail() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("retry.bin");
+		let mut file = AppendOnlyFile::<TestElem>::open(
+			&path, SizeInfo::FixedSize(4), ProtocolVersion(1), 0,
+			VariableSizeMetadataValidation::Full,
+		).unwrap();
+		file.positional_io = true;
+		file.append(&mut [1; 4]).unwrap();
+		file.flush().unwrap();
+		file.append(&mut [2; 4]).unwrap();
+		// Model write_all succeeding partially before a flush returns an error.
+		// The logical buffer and start position remain unchanged on failure.
+		file.file = None;
+		let mut disk = OpenOptions::new().append(true).open(&path).unwrap();
+		disk.write_all(&[9; 12]).unwrap();
+		drop(disk);
+		file.flush().unwrap();
+		assert_eq!(std::fs::read(&path).unwrap(), vec![1, 1, 1, 1, 2, 2, 2, 2]);
+		assert_eq!(file.size_in_elmts().unwrap(), 2);
 	}
 }

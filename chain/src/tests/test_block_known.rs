@@ -101,22 +101,18 @@ fn check_known() {
 		assert!(matches!( res, Err(Error::Unfit(ref s)) if s == "already known in store"));
 	}
 
-	// reset chain head to earlier state
+	// Reset the live chain through the public API, including its PMMR state.
+	// Editing only the persisted tip before reopening is not a reset: startup
+	// reconciliation can recover that tip from the still-current PMMRs.
 	{
 		let chain = init_chain(&secp, chain_dir, genesis.clone());
-		let store = chain.get_store_for_tests();
-		let batch = store.batch_write().unwrap();
 		let head_header = chain.head_header().unwrap();
-		let prev = batch.get_previous_header(&head_header).unwrap();
-		batch
-			.save_body_head(&Tip::try_from_header(&prev).unwrap())
-			.unwrap();
-		batch.commit().unwrap();
-	}
+		let prev = chain.get_block_header(&head_header.prev_hash).unwrap();
+		chain.reset_chain_head(&secp, &prev, false).unwrap();
+		assert_eq!(chain.head().unwrap(), Tip::try_from_header(&prev).unwrap());
 
-	// reprocess latest block and check the updated head
-	{
-		let chain = init_chain(&secp, chain_dir, genesis.clone());
+		// A stored block above the reset head must be applied, not treated as
+		// a duplicate, and must restore a fully valid txhashset.
 		let head = chain
 			.process_block(
 				&mut secp,
@@ -126,6 +122,7 @@ fn check_known() {
 			)
 			.unwrap();
 		assert_eq!(head, Some(Tip::try_from_header(&latest.header).unwrap()));
+		chain.validate(&secp, false).unwrap();
 	}
 
 	clean_output_dir(chain_dir);

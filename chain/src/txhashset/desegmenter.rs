@@ -314,6 +314,7 @@ impl Desegmenter {
 		state_generation: Arc<AtomicU64>,
 		created_at_state_generation: u64,
 	) -> Result<Desegmenter, Error> {
+		store.batch_read()?.validate_checkpoint_header(&archive_header)?;
 		info!(
 			"Creating new desegmenter for bitmap_root_hash {}, height {}",
 			bitmap_root_hash, archive_header.height

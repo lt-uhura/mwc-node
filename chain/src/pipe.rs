@@ -579,7 +579,32 @@ pub fn process_blocks_series(
 	let series_has_more_work = has_more_work(&last_block.header, &head);
 	let skip_pow = ctx.skip_pow();
 
+	// Only preverify already admitted, structurally valid sync bodies. This
+	// read-only preflight neither publishes headers nor changes failure order:
+	// any preflight/batch failure falls through to the original per-block path.
+	if (cfg!(target_os = "ios") || cfg!(test))
+		&& ctx.opts.contains(Options::SYNC)
+		&& (2..=8).contains(&blocks.len())
+		&& option_env!("MWC_CROSS_BLOCK_PROOFS") != Some("0")
+	{
+		let eligible = (|| -> Result<bool, Error> {
+			let header_head = ctx.batch.header_head()?;
+			for b in blocks {
+				if !is_exact_known_header(context_id, &b.header, &header_head, &ctx.batch)? {
+					return Ok(false);
+				}
+				validate_header_hash(context_id, &b.header.hash(context_id)?)?;
+				b.validate_read(context_id).map_err(Error::Block)?;
+			}
+			Ok(true)
+		})();
+		if matches!(eligible, Ok(true)) {
+			Block::preverify_sync_proofs(blocks, secp);
+		}
+	}
+
 	for b in blocks {
+		let mut header_timing = mwc_util::sync_diagnostics::Metric::SeriesHeader.start();
 		// Validate block for deny list, just in case
 		validate_header_hash(context_id, &b.header.hash(context_id)?)?;
 
@@ -592,10 +617,14 @@ pub fn process_blocks_series(
 		// Note: We still want to process the full block if we have seen this header before
 		// as we may have processed it "header first" and not yet processed the full block.
 		process_block_header(context_id, &b.header, ctx, state_may_have_changed)?;
+		header_timing.success();
+		drop(header_timing);
 
 		// Validate the block itself, make sure it is internally consistent.
 		// Use the verifier_cache for verifying rangeproofs and kernel signatures.
+		let mut body_timing = mwc_util::sync_diagnostics::Metric::SeriesBody.start();
 		validate_block(context_id, b, ctx, secp)?;
+		body_timing.success();
 	}
 
 	// Treat a known full block as duplicate only after the incoming block has
@@ -617,13 +646,18 @@ pub fn process_blocks_series(
 	let batch = &mut ctx.batch;
 	let mut retained_spent_records = Vec::new();
 	let mut retained_spent_indexes = Vec::new();
+	let mut extension_timing = mwc_util::sync_diagnostics::Metric::SeriesExtension.start();
 	let fork_point = txhashset::extending(header_pmmr, txhashset, batch, |ext, batch| {
+		let mut fork_timing = mwc_util::sync_diagnostics::Metric::ExtensionFork.start();
 		let fork_point_local_blocks = rewind_and_apply_fork(context_id, &prev, ext, batch, secp)?;
+		fork_timing.success();
+		drop(fork_timing);
 
 		let fork_point = fork_point_local_blocks.0;
 		let mut local_branch_blocks = fork_point_local_blocks.1;
 
 		for b in blocks {
+			let mut checks_timing = mwc_util::sync_diagnostics::Metric::ExtensionChecks.start();
 			replay_attack_check(
 				context_id,
 				b,
@@ -639,19 +673,22 @@ pub fn process_blocks_series(
 			// to applying the new block.
 			verify_coinbase_maturity(context_id, b, ext, batch)?;
 
-			// Validate the block against the UTXO set.
-			validate_utxo(b, ext, batch)?;
-
-			// Using block_sums (utxo_sum, kernel_sum) for the previous block from the db
-			// we can verify_kernel_sums across the full UTXO sum and full kernel sum
-			// accounting for inputs/outputs/kernels in this new block.
-			// We know there are no double-spends etc. if this verifies successfully.
-			verify_block_sums(context_id, b, batch, secp)?;
-
-			// Apply the block to the txhashset state.
-			// Validate the txhashset roots and sizes against the block header.
-			// Block is invalid if there are any discrepencies.
-			let block_spent_records = apply_block_to_txhashset(b, ext, batch)?;
+			// Resolve inputs once for both UTXO validation and application. Sums
+			// verification does not mutate the extension; the scoped helper retains
+			// the validated positions until immediate application and root checks.
+			let block_spent_records = ext.extension.validate_and_apply_block(
+				b,
+				ext.header_extension,
+				batch,
+				|| {
+					checks_timing.success();
+					drop(checks_timing);
+					let mut sums_timing = mwc_util::sync_diagnostics::Metric::ExtensionSums.start();
+					verify_block_sums(context_id, b, batch, secp)?;
+					sums_timing.success();
+					Ok(())
+				},
+			)?;
 			let block_hash = b.hash(context_id)?;
 			retained_spent_indexes.push((
 				block_hash,
@@ -677,6 +714,8 @@ pub fn process_blocks_series(
 
 		Ok(fork_point)
 	})?;
+	extension_timing.success();
+	drop(extension_timing);
 	// A successful higher-work extension has committed its child batch and
 	// synchronized the body PMMRs. Any later error requires reconciliation.
 	// Ordinary pre-sync extension errors have already discarded their provisional
@@ -685,6 +724,7 @@ pub fn process_blocks_series(
 	if series_has_more_work {
 		*state_may_have_changed = true;
 	}
+	let mut store_timing = mwc_util::sync_diagnostics::Metric::SeriesStore.start();
 
 	// Add the validated block to the db.
 	// Note we do this in the outer batch, not the child batch from the extension
@@ -720,6 +760,9 @@ pub fn process_blocks_series(
 	} else {
 		Ok((None, fork_point))
 	};
+	if res.is_ok() {
+		store_timing.success();
+	}
 	res
 }
 
@@ -930,6 +973,7 @@ pub fn process_block_header(
 	if check_known(context_id, header, &head, ctx)?.is_known()
 		&& !has_more_work(header, &header_head)
 	{
+		ctx.batch.validate_checkpoint_header(header)?;
 		return Ok(());
 	}
 
@@ -951,11 +995,15 @@ pub fn process_block_header(
 	// then we can (re)accept this header and process the full block (or request it).
 	// This header is on a fork and we should still accept it as the fork may eventually win.
 	if is_exact_known_header(context_id, header, &header_head, &ctx.batch)? {
+		ctx.batch.validate_checkpoint_header(header)?;
 		return Ok(());
 	}
 
 	// We want to validate this individual header before applying it to our header PMMR.
 	validate_header(context_id, header, ctx)?;
+	// The store guard is defense in depth. Reject here BEFORE a higher-work
+	// header extension can sync/truncate PMMR files and need recovery.
+	ctx.batch.validate_checkpoint_header(header)?;
 
 	// Apply the header to the header PMMR, making sure we put the extension in the correct state
 	// based on previous header first.
@@ -1341,6 +1389,8 @@ fn rewind_and_apply_header_fork_impl(
 	batch: &store::Batch<'_>,
 	recovery_authenticator: Option<&dyn Fn(&BlockHeader) -> Result<(), Error>>,
 ) -> Result<(), Error> {
+	// Gate even already-stored forks and recovery before changing either PMMR.
+	batch.validate_checkpoint_header(header)?;
 	let mut fork_headers = vec![];
 	let mut current = header.clone();
 	let mut visited = HashSet::new();

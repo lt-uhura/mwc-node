@@ -54,6 +54,8 @@ pub struct PruneList {
 	/// Bitmap representing pruned root node positions.
 	bitmap: Bitmap,
 	bitmap_bak: Bitmap,
+	// False only after a complete successful flush, including directory sync.
+	needs_persist: bool,
 	// These caches are derived from the bitmap and are used by get_shift() and
 	// get_leaf_shift() while translating logical PMMR positions to compacted
 	// file positions. Scanning the full prune bitmap for every lookup is too
@@ -74,6 +76,7 @@ impl PruneList {
 			path,
 			bitmap: Bitmap::new(),
 			bitmap_bak: Bitmap::new(),
+			needs_persist: true,
 			shift_cache: vec![],
 			leaf_shift_cache: vec![],
 		};
@@ -133,17 +136,33 @@ impl PruneList {
 
 	/// Save the prune_list to disk.
 	pub fn flush(&mut self) -> io::Result<()> {
+		self.flush_with(|path, bitmap| {
+			save_via_temp_file(path, ".tmp", |file| {
+				file.write_all(&bitmap.serialize::<Portable>())
+			})
+		})
+	}
+
+	fn flush_with(
+		&mut self,
+		persist: impl FnOnce(&Path, &Bitmap) -> io::Result<()>,
+	) -> io::Result<()> {
+		if !self.needs_persist && self.bitmap == self.bitmap_bak {
+			return Ok(());
+		}
+		// A failed replacement may already have changed the file. Even if
+		// discard restores bitmap_bak, the next flush must repair persistence.
+		self.needs_persist = true;
 		// Run the optimization step on the bitmap.
 		self.bitmap.run_optimize();
 
 		// Write the updated bitmap file to disk.
 		if let Some(ref path) = self.path {
-			save_via_temp_file(path, ".tmp", |file| {
-				file.write_all(&self.bitmap.serialize::<Portable>())
-			})?;
+			persist(path, &self.bitmap)?;
 		}
 
 		self.bitmap_bak = self.bitmap.clone();
+		self.needs_persist = false;
 		Ok(())
 	}
 
@@ -674,6 +693,81 @@ impl<I: Iterator<Item = Range<u64>>> Iterator for UnprunedIterator<I> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn flush_persists_creation_and_changes_but_skips_unchanged() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("prune");
+		let mut list = PruneList::open(&path).unwrap();
+		list.flush().unwrap();
+		assert!(read_bitmap(&path).unwrap().is_empty());
+		list.flush_with(|_, _| panic!("unchanged bitmap written"))
+			.unwrap();
+		list.append(0).unwrap();
+		list.flush().unwrap();
+		assert_eq!(read_bitmap(&path).unwrap(), list.bitmap);
+		list.append(1).unwrap();
+		list.discard().unwrap();
+		list.flush_with(|_, _| panic!("discarded mutation written"))
+			.unwrap();
+		list.append(1).unwrap();
+		list.flush().unwrap();
+		let reopened = PruneList::open(&path).unwrap();
+		assert_eq!(reopened.bitmap, list.bitmap);
+		assert_eq!(
+			reopened.get_total_shift().unwrap(),
+			list.get_total_shift().unwrap()
+		);
+	}
+
+	#[test]
+	fn flush_failure_retries_before_and_after_file_replacement() {
+		for replaced in [false, true] {
+			for discard in [false, true] {
+				let dir = mwc_crates::tempfile::tempdir().unwrap();
+				let path = dir.path().join("prune");
+				let mut list = PruneList::open(&path).unwrap();
+				list.append(0).unwrap();
+				list.flush().unwrap();
+				let original = list.bitmap.clone();
+				list.append(1).unwrap();
+				let changed = list.bitmap.clone();
+				assert!(
+					list.flush_with(|path, bitmap| {
+						if replaced {
+							save_via_temp_file(path, ".tmp", |f| {
+								f.write_all(&bitmap.serialize::<Portable>())
+							})?;
+						}
+						Err(io::Error::other("injected persistence failure"))
+					})
+					.is_err()
+				);
+				if discard {
+					list.discard().unwrap();
+				}
+				list.flush().unwrap();
+				assert_eq!(
+					read_bitmap(&path).unwrap(),
+					if discard { original } else { changed }
+				);
+				list.flush_with(|_, _| panic!("successful retry still dirty"))
+					.unwrap();
+			}
+		}
+	}
+
+	#[test]
+	fn new_bitmap_must_replace_existing_file_even_when_backup_matches() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let path = dir.path().join("prune");
+		let mut list = PruneList::open(&path).unwrap();
+		list.append(0).unwrap();
+		list.flush().unwrap();
+		let mut replacement = PruneList::new(Some(path.clone()), Bitmap::new()).unwrap();
+		replacement.flush().unwrap();
+		assert!(read_bitmap(&path).unwrap().is_empty());
+	}
 
 	#[test]
 	fn get_cache_rejects_rank_beyond_cache_len() {

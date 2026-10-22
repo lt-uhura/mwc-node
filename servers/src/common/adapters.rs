@@ -500,6 +500,14 @@ where
 		opts: Options,
 	) -> Result<bool, mwc_chain::Error> {
 		let b_hash = b.hash(self.context_id)?;
+		let request_age = self.sync_manager.body_request_age_at(&b_hash, &peer_info.addr, Instant::now());
+		if let Some(age) = request_age {
+			self.sync_manager.record_body_delivery(&peer_info.addr, age);
+		}
+		mwc_util::sync_diagnostics::record_block_arrival(b_hash.as_bytes(), request_age.is_some());
+		if let Some(age) = request_age {
+			mwc_util::sync_diagnostics::Metric::RequestToAdapter.record(age, true);
+		}
 		if self.sync_state.is_txhashset_validation() {
 			info!(
 				"block_received: skipping {} at {} from {} while txhashset validation holds chain PMMR locks",
@@ -511,18 +519,36 @@ where
 		let chain = self.chain()?;
 		let total_blocks = chain.header_head()?.height;
 
-		info!(
-			"Received block {} of {} hash {} from {} [in/out/kern: {}/{}/{}] going to process. Prev block Hash: {}",
-			b.header.height,
-			total_blocks,
-			b_hash,
-			peer_info.addr,
-			b.inputs().len(),
-			b.outputs().len(),
-			b.kernels().len(),
-			b.header.prev_hash,
-		);
+		// Per-block receipt at Info floods the iOS C log callback / SwiftUI
+		// during body sync. Keep Info for live tip blocks on desktop/server.
+		if cfg!(target_os = "ios") || opts.contains(Options::SYNC) {
+			debug!(
+				"Received block {} of {} hash {} from {} [in/out/kern: {}/{}/{}] going to process. Prev block Hash: {}",
+				b.header.height,
+				total_blocks,
+				b_hash,
+				peer_info.addr,
+				b.inputs().len(),
+				b.outputs().len(),
+				b.kernels().len(),
+				b.header.prev_hash,
+			);
+		} else {
+			info!(
+				"Received block {} of {} hash {} from {} [in/out/kern: {}/{}/{}] going to process. Prev block Hash: {}",
+				b.header.height,
+				total_blocks,
+				b_hash,
+				peer_info.addr,
+				b.inputs().len(),
+				b.outputs().len(),
+				b.kernels().len(),
+				b.header.prev_hash,
+			);
+		}
+		let mut timing = mwc_util::sync_diagnostics::Metric::ProcessBlock.start();
 		let processed = self.process_block(secp, b, peer_info, opts)?;
+		if processed { timing.success(); }
 		Ok(processed)
 	}
 
@@ -1404,15 +1430,39 @@ where
 		};
 
 		let bhash = b.hash(self.context_id)?;
-		match chain.process_block(
+		let processing_started = Instant::now();
+		let origin = mwc_util::sync_diagnostics::body_origin(bhash.as_bytes(), &peer_info.addr.to_string());
+		mwc_util::sync_diagnostics::observe_retry_arrival(b.header.height, origin);
+		let header_wait_before = mwc_util::sync_diagnostics::header_wait_total();
+		let processing_result = chain.process_block(
 			secp,
 			b.clone(),
 			opts,
 			std::iter::once(peer_info.addr.to_string()).collect(),
-		) {
+		);
+		use mwc_util::sync_diagnostics::BlockOutcome;
+		let outcome = match &processing_result {
+			Ok(_) => BlockOutcome::Accepted,
+			Err(e) if e.is_known_block() => BlockOutcome::Known,
+			Err(e) if e.is_bad_data() => BlockOutcome::BadData,
+			Err(e) if matches!(e, mwc_chain::Error::Orphan(_)) || e.is_not_found() => BlockOutcome::Pending,
+			Err(_) => BlockOutcome::Error,
+		};
+		outcome.record(processing_started.elapsed());
+		if matches!(outcome, BlockOutcome::Known) {
+			mwc_util::sync_diagnostics::record_known_cost(origin, processing_started.elapsed(),
+				mwc_util::sync_diagnostics::header_wait_total().saturating_sub(header_wait_before));
+		}
+		match processing_result {
 			Ok(_) => {
 				self.validate_chain(secp, &bhash)?;
 				//self.check_compact();  Currently Sync process does that. No needs, also we don't want collision to happens
+				if let SyncStatus::BodySync { highest_height, .. } = self.sync_state.status() {
+					info!(
+						"body sync applied height {} / {}",
+						b.header.height, highest_height
+					);
+				}
 				self.sync_manager.recieve_block_reporting(
 					Some(true),
 					&peer_info.addr,
@@ -1459,6 +1509,10 @@ where
 						"process_block: block {} from peer {} failed chain processing: {}",
 						bhash, peer_info.addr, e
 					);
+					// PMMR/apply failures must drop the hash so in_flight cannot
+					// stick forever when the next height cannot be applied.
+					self.sync_manager
+						.clear_body_request(&bhash, &peer_info.addr);
 					return Err(e);
 				}
 				let prev_block_hash = b.header.prev_hash.clone();

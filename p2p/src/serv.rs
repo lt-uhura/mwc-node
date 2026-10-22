@@ -18,7 +18,7 @@ use crate::peer::Peer;
 use crate::peers::Peers;
 use crate::store::PeerStore;
 use crate::tor::arti;
-use crate::tor::tcp_data_stream::TcpDataStream;
+use crate::tor::tcp_data_stream::{TcpData, TcpDataStream};
 use crate::types::PeerAddr::Onion;
 use crate::types::{
 	Capabilities, ChainAdapter, Error, NetAdapter, P2PConfig, PeerAddr, PeerInfo, ReasonForBan,
@@ -34,7 +34,7 @@ use mwc_core::core::hash::Hash;
 use mwc_core::core::{OutputIdentifier, Segment, SegmentIdentifier, TxKernel};
 use mwc_core::global;
 use mwc_core::pow::Difficulty;
-use mwc_crates::log::{debug, error, trace, warn};
+use mwc_crates::log::{debug, error, info, trace, warn};
 use mwc_crates::parking_lot::{Mutex, RwLock};
 use mwc_crates::rand::rngs::SysRng;
 use mwc_crates::secp::pedersen::RangeProof;
@@ -55,6 +55,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
+
+// The iOS app runs both listeners. Desktop Tor mode retains its existing
+// all-through-Tor policy; a failed direct connection never falls back silently.
+fn use_tor_for_peer(tor_enabled: bool, dual_transport: bool, addr: &PeerAddr) -> bool {
+	tor_enabled && (!dual_transport || matches!(addr, PeerAddr::Onion(_)))
+}
 
 /// P2P server implementation, handling bootstrapping to find and connect to
 /// peers, receiving connections from other peers and keep track of all of them.
@@ -191,7 +197,6 @@ impl Server {
 			None => false,
 		};
 
-		let is_global_listener = !self.tor_config.is_tor_enabled();
 		let inbound_handshakes = Arc::new(AtomicU32::new(0));
 		let max_inbound_count = usize::try_from(
 			self.config
@@ -211,13 +216,20 @@ impl Server {
 
 		let handle_new_connection_callback =
 			move |stream: TcpDataStream, peer_address: Option<PeerAddr>| {
-				let peer_address = if is_global_listener {
-					peer_address
-				} else {
-					None
-				};
-
+				// TCP can bind before the onion startup callback installs our
+				// handshake identity. Do not ban early callers for our startup.
+				if !server.is_ready() {
+					info!("P2P inbound deferred: handshake identity not ready peer={:?}", peer_address);
+					if let Err(err) = stream.shutdown() {
+						debug!("Unable to close early inbound stream: {}", err);
+					}
+					return;
+				}
 				if server.check_undesirable(peer_address.as_ref()) {
+					info!(
+						"P2P inbound refused by check_undesirable peer={:?}",
+						peer_address
+					);
 					// Shutdown the incoming TCP connection if it is not desired
 					if let Err(e) = stream.shutdown() {
 						debug!("Error shutting down conn: {:?}", e);
@@ -231,8 +243,9 @@ impl Server {
 					max_inbound_count,
 					established_inbound_count,
 				) else {
-					debug!(
-						"Too many inbound peers or handshakes in progress, refusing connection."
+					info!(
+						"P2P inbound refused: too many inbound peers or handshakes in progress peer={:?} established_inbound={} max_inbound={}",
+						peer_address, established_inbound_count, max_inbound_count
 					);
 					if let Err(e) = stream.shutdown() {
 						debug!("Error shutting down conn: {:?}", e);
@@ -247,7 +260,7 @@ impl Server {
 						let _guard = guard;
 						server.handle_new_connection(stream, peer_address);
 					}) {
-					debug!("Unable to start inbound handshake thread: {}", e);
+					warn!("Unable to start inbound handshake thread: {}", e);
 				}
 			};
 
@@ -481,7 +494,10 @@ impl Server {
 			return Ok(p);
 		}
 
-		let stream: TcpDataStream = if self.tor_config.is_tor_enabled() {
+		let use_tor = use_tor_for_peer(
+			self.tor_config.is_tor_enabled(), cfg!(target_os = "ios"), addr,
+		);
+		let stream: TcpDataStream = if use_tor {
 			let stream: DataStream = arti::access_arti(|arti| {
 				arti::arti_async_block(async {
 					let arti_cancelled =
@@ -542,7 +558,7 @@ impl Server {
 									format!("connect timeout for {}", address),
 								))
 							})?
-							.map_err(|e| Error::TorConnect(e.to_string()))?;
+							.map_err(Error::Connection)?;
 					Ok::<TcpDataStream, Error>(TcpDataStream::from_tcp(stream))
 				})
 				.map_err(|e| Error::Internal(e.to_string()))??,
@@ -563,22 +579,25 @@ impl Server {
 			.cloned()
 			.ok_or(Error::TorConnect("handshake is empty".into()))?;
 
-		let self_addr = match self_onion_address {
-			Some(onion_addr) => PeerAddr::Onion(onion_addr),
-			None => {
-				if self.tor_config.is_tor_enabled() {
-					PeerAddr::Ip(SocketAddr::new(
-						IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-						self.config.port,
-					))
-				} else {
-					PeerAddr::Ip(SocketAddr::new(
-						IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-						self.config.port,
-					))
-				}
+		// A direct TCP peer learns our observed source IP plus the listening
+		// port, just as it does for a Tor-disabled desktop node. An onion
+		// connection continues advertising the signed onion identity.
+		let direct_tcp = matches!(&stream.stream, TcpData::Tcp(_));
+		let self_addr = if direct_tcp {
+			PeerAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.config.port))
+		} else {
+			match self_onion_address {
+				Some(onion_addr) => PeerAddr::Onion(onion_addr),
+				None => PeerAddr::Ip(SocketAddr::new(
+					IpAddr::V4(Ipv4Addr::LOCALHOST), self.config.port,
+				)),
 			}
 		};
+		#[cfg(target_os = "ios")]
+		info!(
+			"P2P inbound discovery: outbound_transport={} destination={} advertised_sender={}",
+			if direct_tcp { "tcp" } else { "tor" }, addr, self_addr
+		);
 
 		let (peer, stream) = Peer::connect(
 			stream,
@@ -637,15 +656,22 @@ impl Server {
 	}
 
 	fn handle_new_connection(&self, stream: TcpDataStream, peer_address: Option<PeerAddr>) {
-		match self.handle_new_peer(stream) {
-			Err(Error::BadHandshake(err)) => {
-				self.ban_bad_handshake(peer_address.as_ref(), &err);
+		if let Err(err) = self.handle_new_peer(stream) {
+			self.handle_inbound_failure(peer_address.as_ref(), err);
+		}
+	}
+
+	fn handle_inbound_failure(&self, peer_address: Option<&PeerAddr>, err: Error) {
+		match err {
+			// EOF, reset, and timeouts do not establish protocol misconduct.
+			// A TCP port probe must not ban every node behind its IP.
+			Error::Connection(_)
+			| Error::Serialization(mwc_core::ser::Error::IOErr(_))
+			| Error::Timeout
+			| Error::ConnectionClose(_) => {
+				info!("P2P inbound connection ended without ban peer={:?} err={}", peer_address, err);
 			}
-			Err(Error::ConnectionClose(err)) => {
-				debug!("shutting down, ignoring a new peer, {}", err)
-			}
-			Err(e) => self.ban_bad_handshake(peer_address.as_ref(), &e),
-			Ok(_) => {}
+			_ => self.ban_bad_handshake(peer_address, &err),
 		}
 	}
 
@@ -656,13 +682,7 @@ impl Server {
 	) {
 		match peer_address {
 			Some(peer) => {
-				debug!("Error accepting peer {}: {}", peer, err);
-				// Use a conservative policy for accept failures: ban the peer
-				// even if the immediate error may be local/internal. This keeps
-				// the accept path simple, and banning a self address is acceptable
-				// because we normally should not connect to ourselves and the ban
-				// prevents reusing that address while it is suspect. Accidental bans
-				// are not critical and will be lifted by normal ban expiry.
+				info!("P2P inbound handshake failed peer={} err={}", peer, err);
 				if let Err(e) = self.peers.add_banned(
 					peer.clone(),
 					ReasonForBan::BadHandshake,
@@ -671,11 +691,15 @@ impl Server {
 					warn!("Failed to ban peer {} after bad handshake: {}", peer, e);
 				}
 			}
-			None => debug!("Error accepting onion peer. {}", err),
+			None => info!("P2P inbound onion handshake failed err={}", err),
 		}
 	}
 
 	fn handle_new_peer(&self, stream: TcpDataStream) -> Result<(), Error> {
+		let transport = match &stream.stream {
+			crate::tor::tcp_data_stream::TcpData::Tor(_) => "onion",
+			crate::tor::tcp_data_stream::TcpData::Tcp(_) => "tcp",
+		};
 		if self.stop_state.is_stopped() {
 			return Err(Error::ConnectionClose(String::from("Server is stopping")));
 		}
@@ -721,7 +745,9 @@ impl Server {
 		)?;
 		// if we are using TOR, it will be the local addressed because it comes from the proxy
 		// Will still need to save all the peers and renameit after peer will share the TOR address
+		let peer_addr = peer.info.addr.clone();
 		self.add_connected_peer(peer, stream)?;
+		info!("P2P inbound peer established transport={} peer={}", transport, peer_addr);
 		Ok(())
 	}
 
@@ -754,19 +780,19 @@ impl Server {
 			.unwrap_or(usize::MAX),
 		);
 		if self.peers.iter().inbound().connected().count() >= max_inbound_count {
-			debug!("Accepting new connection will exceed peer limit, refusing connection.");
+			info!("P2P inbound refused: inbound peer limit reached max_inbound={}", max_inbound_count);
 			return true;
 		}
 		if let Some(peer_addr) = peer_address {
 			match self.peers.is_banned(&peer_addr) {
 				Ok(true) => {
-					debug!("Peer {} banned, refusing connection.", peer_addr);
+					info!("P2P inbound refused: peer banned peer={}", peer_addr);
 					return true;
 				}
 				Ok(false) => {}
 				Err(e) => {
-					debug!(
-						"Unable to verify ban state for {}, refusing connection: {}",
+					info!(
+						"P2P inbound refused: unable to verify ban state peer={} err={}",
 						peer_addr, e
 					);
 					return true;
@@ -775,7 +801,7 @@ impl Server {
 			// The call to is_known() can fail due to contention on the peers map.
 			// If it fails we want to default to refusing the connection.
 			if self.peers.is_known(&peer_addr) {
-				debug!("Peer {} already known, refusing connection.", peer_addr);
+				info!("P2P inbound refused: peer already known/connected peer={}", peer_addr);
 				return true;
 			}
 		}
@@ -1194,4 +1220,46 @@ fn test_tor_address_parsing() {
 	assert!(r2.is_err());
 	let r3 = (address3, 80).into_tor_addr();
 	assert!(r3.is_err());
+}
+
+#[test]
+fn inbound_transport_failures_do_not_persist_bans() {
+	let context_id = 249;
+	global::init_global_chain_type(context_id, global::ChainTypes::AutomatedTesting).unwrap();
+	global::init_global_accept_fee_base(context_id, 1000).unwrap();
+	let dir = mwc_crates::tempfile::TempDir::new().unwrap();
+	let server = Server::new(
+		context_id, dir.path().to_str().unwrap(), Capabilities::UNKNOWN,
+		&P2PConfig::default(), &TorConfig::no_tor_config(), Arc::new(DummyAdapter {}),
+		Hash::from_vec(&vec![]), Arc::new(SyncState::new()), Arc::new(StopState::new()),
+	).unwrap();
+	let addr = PeerAddr::Ip("192.168.0.114:51152".parse().unwrap());
+	for kind in [std::io::ErrorKind::UnexpectedEof, std::io::ErrorKind::ConnectionReset,
+		std::io::ErrorKind::TimedOut] {
+		server.handle_inbound_failure(Some(&addr), Error::Connection(std::io::Error::from(kind)));
+		assert!(!server.peers.is_banned(&addr).unwrap());
+	}
+	server.handle_inbound_failure(Some(&addr), Error::Serialization(
+		mwc_core::ser::Error::IOErr(std::io::ErrorKind::UnexpectedEof.into())));
+	server.handle_inbound_failure(Some(&addr), Error::Timeout);
+	server.handle_inbound_failure(Some(&addr), Error::ConnectionClose("stopping".into()));
+	let retry = PeerAddr::Ip("192.168.0.114:53206".parse().unwrap());
+	assert!(!server.check_undesirable(Some(&retry)));
+	server.handle_inbound_failure(Some(&addr), Error::BadHandshake("invalid proof".into()));
+	assert!(server.peers.is_banned(&retry).unwrap());
+	assert!(server.check_undesirable(Some(&retry)));
+}
+
+#[test]
+fn dual_transport_routes_ip_directly_and_keeps_onion_on_tor() {
+	let ip = PeerAddr::Ip("203.0.113.10:3414".parse().unwrap());
+	let onion = PeerAddr::Onion("example.onion".into());
+	assert!(!use_tor_for_peer(true, true, &ip));
+	assert!(use_tor_for_peer(true, true, &onion));
+	// Desktop Tor mode must not unexpectedly expose direct connections.
+	assert!(use_tor_for_peer(true, false, &ip));
+	assert!(use_tor_for_peer(true, false, &onion));
+	// Tor-disabled mode still reaches the existing onion-rejection path.
+	assert!(!use_tor_for_peer(false, true, &ip));
+	assert!(!use_tor_for_peer(false, true, &onion));
 }

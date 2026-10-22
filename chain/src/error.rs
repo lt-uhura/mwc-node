@@ -422,6 +422,28 @@ impl Error {
 		}
 	}
 
+	/// Local leftover-index / PMMR-rebuild failures during stored-body replay.
+	/// Callers must not treat these as peer-supplied bad data; retry with backoff.
+	pub fn is_stored_body_replay_retryable(&self) -> bool {
+		matches!(self, Error::TxHashSetErr(_) | Error::AlreadySpent(_))
+			|| self.is_pmmr_rewind_forward()
+	}
+
+	/// PMMR rewind requested a size ahead of the current file. Stored-body
+	/// replay must back off rather than fail the sync loop every tick.
+	pub fn is_pmmr_rewind_forward(&self) -> bool {
+		match self {
+			Error::PMMRErr(e) => e.to_string().contains("cannot rewind PMMR forward"),
+			Error::TxHashSetErr(msg) | Error::Other(msg) => {
+				msg.contains("cannot rewind PMMR forward")
+			}
+			Error::TxHashSetDiscardAfterError { primary, .. } => {
+				primary.is_pmmr_rewind_forward()
+			}
+			_ => self.to_string().contains("cannot rewind PMMR forward"),
+		}
+	}
+
 	/// Whether the error means PMMR rollback/discard cleanup failed.
 	pub fn is_txhashset_discard_failure(&self) -> bool {
 		matches!(
@@ -436,6 +458,40 @@ impl Error {
 			self,
 			Error::PmmrSyncStateUncertain { .. } | Error::CommittedRecoveryFailed { .. }
 		) || self.is_txhashset_discard_failure()
+	}
+
+	/// LMDB map-full (including StoreErr wrapping the iOS no-runtime-remap error).
+	pub fn is_lmdb_map_full(&self) -> bool {
+		fn matches_map_full(s: &str) -> bool {
+			s.contains("LMDB map is full")
+				|| s.contains("MDB_MAP_FULL")
+				|| s.contains("MapFull")
+				|| s.contains("restart the node to grow the map")
+		}
+		match self {
+			Error::StoreErr(inner, ctx) => {
+				inner.is_lmdb_map_full() || matches_map_full(ctx) || matches_map_full(&self.to_string())
+			}
+			_ => matches_map_full(&self.to_string()),
+		}
+	}
+
+	/// iOS rangeproof/output/kernel PMMR remap or grow failed with ENOMEM.
+	pub fn is_pmmr_enomem(&self) -> bool {
+		let matches_enomem = |s: &str| {
+			s.contains("Cannot allocate memory")
+				|| s.contains("ENOMEM")
+				|| s.contains("os error 12")
+				|| s.contains("iOS PMMR sync")
+				|| s.contains("Out of memory")
+		};
+		match self {
+			Error::PmmrSyncStateUncertain { source, .. } => {
+				source.kind() == io::ErrorKind::OutOfMemory || matches_enomem(&source.to_string())
+			}
+			Error::TxHashSetDiscardAfterError { primary, .. } => primary.is_pmmr_enomem(),
+			_ => matches_enomem(&self.to_string()),
+		}
 	}
 
 	/// Whether this error represents missing chain data.

@@ -18,12 +18,13 @@ use mwc_crates::futures;
 use mwc_crates::http::Response;
 use mwc_crates::http_body_util::{BodyExt, Full};
 use mwc_crates::libc;
-use mwc_crates::log::Level;
+use mwc_crates::log::{error, Level};
 use mwc_crates::serde::de::DeserializeOwned;
 use mwc_crates::serde_json;
 use mwc_crates::serde_json::{json, Value};
 use mwc_crates::zeroize::Zeroizing;
 use mwc_servers::{ServerConfig, ServerStats};
+use mwc_util::ToHex;
 use mwc_util::logger::CallbackLoggingConfig;
 use safer_ffi::prelude::*;
 use std::ffi::CString;
@@ -204,6 +205,16 @@ fn process_request(input: String) -> Result<Value, String> {
 				.map_err(|e| format!("Unable to start the dandelion service, {}", e))?;
 			json!({})
 		}
+		"local_checkpoint" => {
+			let action: String = get_param(&params, "action")?;
+			let (pin, conflict, depth) = mwc_node_workflow::server::local_checkpoint(
+				get_param(&params, "context_id")?, &action,
+				get_option_param::<u64>(&params, "value")?.unwrap_or(0),
+				&get_option_param::<String>(&params, "hash")?.unwrap_or_default(),
+				get_option_param::<u64>(&params, "depth")?,
+			).map_err(|e| e.to_string())?;
+			json!({ "checkpoint": pin.map(|p| json!({"height": p.height, "hash": p.last_block_h.to_hex()})), "conflict": conflict, "rolling_depth": depth })
+		}
 		"get_server_stats" => {
 			let stats: ServerStats =
 				mwc_node_workflow::server::get_server_stats(get_param(&params, "context_id")?)
@@ -250,8 +261,15 @@ fn process_create_server_request(params: &mut Value) -> Result<Value, String> {
 
 	let mut config = ServerConfig::default();
 	config.db_root = db_root;
+	config.clear_local_checkpoint_on_start = get_option_object_param(params, "clear_local_checkpoint_on_start")?.unwrap_or(false);
 	config.chain_type =
 		mwc_node_workflow::context::get_chain_type(context_id).map_err(|e| e.to_string())?;
+	config.archive_mode = get_option_object_param(params, "archive_mode")?;
+	// Parse from text because PeerAddrs' visitor borrows string entries.
+	if let Some(value) = params.get("peers_preferred") {
+		config.p2p_config.peers_preferred = Some(serde_json::from_str(&value.to_string())
+			.map_err(|e| format!("Invalid peers_preferred: {}", e))?);
+	}
 
 	let hook_callback_name: Option<String> = get_option_object_param(params, "hook_callback_name")?;
 	if let Some(hook_callback_name) = hook_callback_name {
@@ -266,10 +284,21 @@ fn process_create_server_request(params: &mut Value) -> Result<Value, String> {
 				"data": value,
 			});
 
-			// Payload to String is fatal error. Normally payload is well defined, it should never happen
-			let payload = serde_json::to_string(&payload).expect("Json encoding failure");
-			// Converting to C String failure is fatal. It is breaking contract between this library and parent app.
-			let c_payload = CString::new(payload).expect("Unable convert string into C format");
+			// Do not panic the process on encode/CString failure — skip the event.
+			let payload = match serde_json::to_string(&payload) {
+				Ok(s) => s,
+				Err(e) => {
+					error!("node_event_callback: json encode failed: {}", e);
+					return;
+				}
+			};
+			let c_payload = match CString::new(payload) {
+				Ok(s) => s,
+				Err(e) => {
+					error!("node_event_callback: CString conversion failed: {}", e);
+					return;
+				}
+			};
 			let c_compatible_ref: *const libc::c_char = c_payload.as_c_str().as_ptr();
 			// Note, c_compatible_ref can't be stored at C code
 			call_lib_callback(&hook_callback_name, c_compatible_ref);
@@ -282,6 +311,10 @@ fn process_create_server_request(params: &mut Value) -> Result<Value, String> {
 		// the retained field on drop.
 		config.p2p_config.onion_expanded_key = Some(std::mem::take(&mut *onion_expanded_key));
 	}
+
+	// Disable Tor on mobile — Arti bootstrap hangs on iOS/Android.
+	let tor_enabled: Option<bool> = get_option_object_param(params, "tor_enabled")?;
+	config.tor_config.tor_enabled = Some(tor_enabled.unwrap_or(false));
 
 	mwc_node_workflow::server::create_server(
 		context_id,
@@ -373,6 +406,17 @@ pub(crate) fn call_mwc_node_request(input: String) -> String {
 mod tests {
 	use super::*;
 	use mwc_crates::http::StatusCode;
+
+	#[test]
+	fn preferred_peer_json_accepts_addresses_and_rejects_invalid_values() {
+		let value = json!(["64.23.190.163:3414", "159.89.145.191:3414"]);
+		let peers: mwc_p2p::msg::PeerAddrs = serde_json::from_str(&value.to_string()).unwrap();
+		assert_eq!(peers.as_slice().len(), 2);
+		for invalid in [json!(["not a peer"]), json!([42]), json!("64.23.190.163:3414")] {
+			assert!(serde_json::from_str::<mwc_p2p::msg::PeerAddrs>(&invalid.to_string()).is_err());
+		}
+		assert!(ServerConfig::default().p2p_config.peers_preferred.is_none());
+	}
 
 	fn api_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
 		Response::builder()

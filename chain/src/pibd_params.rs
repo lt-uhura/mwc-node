@@ -95,6 +95,11 @@ impl PibdParams {
 			res.cpu_num,
 			res.sys_memory_info.read_recursive().available_memory_mb
 		);
+		#[cfg(target_os = "ios")]
+		debug!(
+			"PibdParams: iOS forced to lowest memory tier (orphans_num_limit={})",
+			ORPHANS_BUFFER_LEN[0]
+		);
 		res
 	}
 
@@ -246,19 +251,31 @@ impl PibdParams {
 			return Err("PIBD memory parameter values must not be empty");
 		}
 
-		let max_idx = vals.len() - 1;
-		let idx = if available_memory_mb < 500 || num_cores <= 1 {
-			0
-		} else if available_memory_mb < 1000 || num_cores <= 2 {
-			cmp::min(1, max_idx)
-		} else if available_memory_mb < 2000 {
-			cmp::min(2, max_idx)
-		} else {
-			debug_assert!(vals.len() <= 4); // it is not true, add more ifs for memory checking
-			cmp::min(3, max_idx)
-		};
+		// iPhone sysinfo available_memory() reports enough RAM to pick the top
+		// tier (250 orphans ≈ 375MB of 1.5MB blocks). Force the lowest mobile
+		// tier so the body-sync request window stays a handful of full blocks.
+		#[cfg(target_os = "ios")]
+		{
+			let _ = (available_memory_mb, num_cores);
+			return Ok(vals[0].clone());
+		}
 
-		Ok(vals[idx].clone())
+		#[cfg(not(target_os = "ios"))]
+		{
+			let max_idx = vals.len() - 1;
+			let idx = if available_memory_mb < 500 || num_cores <= 1 {
+				0
+			} else if available_memory_mb < 1000 || num_cores <= 2 {
+				cmp::min(1, max_idx)
+			} else if available_memory_mb < 2000 {
+				cmp::min(2, max_idx)
+			} else {
+				debug_assert!(vals.len() <= 4); // it is not true, add more ifs for memory checking
+				cmp::min(3, max_idx)
+			};
+
+			Ok(vals[idx].clone())
+		}
 	}
 }
 

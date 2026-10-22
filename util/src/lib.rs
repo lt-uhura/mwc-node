@@ -66,6 +66,9 @@ pub use crate::logger::{init_logger, init_test_logger};
 
 // Static secp instance
 pub mod secp_static;
+pub mod sync_diagnostics;
+mod thread_cpu;
+pub mod worker_qos;
 
 pub mod types;
 pub use crate::types::ZeroingString;

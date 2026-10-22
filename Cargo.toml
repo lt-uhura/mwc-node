@@ -13,7 +13,10 @@ edition = "2024"
 
 [workspace]
 members = ["api", "chain", "config", "core", "keychain", "mwc_crates", "p2p", "servers", "store", "util", "pool", "node_workflow", "mwc_node_lib"]
-exclude = ["etc/gen_gen", "vendor/saturating-time", "vendor/tor-ptmgr"]
+exclude = ["etc/gen_gen", "vendor/saturating-time", "vendor/tor-ptmgr", "vendor/mwc_secp256k1zkp"]
+
+[patch."https://github.com/mwcproject/rust-secp256k1-zkp"]
+mwc_secp256k1zkp = { path = "vendor/mwc_secp256k1zkp" }
 
 [patch.crates-io]
 # Arti 0.44+ exercises a Windows hang in saturating-time 0.4.0 while parsing a consensus.

@@ -19,7 +19,7 @@ path = "src/generate_headers.rs"
 
 [dependencies]
 safer-ffi.workspace = true
-mwc_crates = { path = "../mwc_crates", version = "7.1.0" }
+mwc_crates = { path = "../mwc_crates", version = "7.1.0", default-features = false }
 mwc_node_workflow = { path = "../node_workflow", version = "7.1.0" }
 mwc_core = { path = "../core", version = "7.1.0" }
 mwc_p2p = { path = "../p2p", version = "7.1.0" }

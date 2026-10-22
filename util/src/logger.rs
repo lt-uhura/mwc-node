@@ -368,7 +368,13 @@ where
 {
 	fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
 		let metadata = event.metadata();
-		let level = tracing_level_to_log(metadata.level());
+		// Surface the underlying onion-pool failures in the iOS Info log without
+		// enabling verbose tracing for the entire Tor/node stack.
+		let level = if mobile_onion_diagnostic(metadata) {
+			Level::Info
+		} else {
+			tracing_level_to_log(metadata.level())
+		};
 		if !mwc_crates::log::log_enabled!(target: metadata.target(), level) {
 			return;
 		}
@@ -440,8 +446,16 @@ fn active_root_level(config: &LoggingConfig, tui_running: bool) -> LevelFilter {
 }
 
 fn install_tracing_bridge(level: LevelFilter) {
+	#[cfg(not(target_os = "ios"))]
 	let subscriber = tracing_subscriber::registry()
 		.with(Log4rsLayer.with_filter(log_level_to_tracing_filter(level)));
+	#[cfg(target_os = "ios")]
+	let subscriber = tracing_subscriber::registry().with(Log4rsLayer.with_filter(
+		tracing_subscriber::filter::filter_fn(move |metadata| {
+			tracing_level_to_log(metadata.level()).to_level_filter() <= level
+				|| (level >= LevelFilter::Info && mobile_onion_diagnostic(metadata))
+		}),
+	));
 	if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
 		// Log4rs is already committed and cannot be rolled back. An embedding
 		// application may legitimately own the tracing subscriber.
@@ -450,6 +464,12 @@ fn install_tracing_bridge(level: LevelFilter) {
 			e
 		);
 	}
+}
+
+fn mobile_onion_diagnostic(metadata: &tracing::Metadata<'_>) -> bool {
+	cfg!(target_os = "ios")
+		&& matches!(metadata.target(), "tor_circmgr::hspool" | "tor_hsservice::publish::reactor")
+		&& *metadata.level() == tracing::Level::DEBUG
 }
 
 /// Initialize the process-global logger with the given configuration.

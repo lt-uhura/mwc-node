@@ -1399,10 +1399,14 @@ impl TransactionBody {
 		weighting: Weighting,
 		secp: &mut Secp256k1,
 	) -> Result<(), Error> {
+		let mut structural = util::sync_diagnostics::Metric::ValidationStructure.start();
 		self.validate_read(context_id, weighting)?;
+		structural.success();
+		drop(structural);
 
 		// Now batch verify all those unverified rangeproofs
 		if !self.outputs.is_empty() {
+			let mut timing = util::sync_diagnostics::Metric::ValidationProofs.start();
 			let mut commits = vec![];
 			let mut proofs = vec![];
 			for x in &self.outputs {
@@ -1410,10 +1414,13 @@ impl TransactionBody {
 				proofs.push(x.proof);
 			}
 			Output::batch_verify_proofs(&commits, &proofs, secp)?;
+			timing.success();
 		}
 
 		// Verify the unverified tx kernels.
+		let mut timing = util::sync_diagnostics::Metric::ValidationSignatures.start();
 		TxKernel::batch_sig_verify(context_id, &self.kernels, secp)?;
+		timing.success();
 		Ok(())
 	}
 
@@ -2788,8 +2795,13 @@ impl Output {
 		proofs: &[RangeProof],
 		secp: &mut Secp256k1,
 	) -> Result<(), Error> {
+		#[cfg(any(target_os = "ios", test, feature = "test-proof-cache"))]
+		return super::proof_cache::verify(commits, proofs, secp);
+		#[cfg(not(any(target_os = "ios", test, feature = "test-proof-cache")))]
+		{
 		secp.verify_bullet_proof_multi(commits.to_vec(), proofs.to_vec(), None)?;
 		Ok(())
+		}
 	}
 }
 

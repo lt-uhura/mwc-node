@@ -36,6 +36,7 @@ pub fn run_sync(
 	thread::Builder::new()
 		.name("sync".to_string())
 		.spawn(move || {
+			mwc_util::worker_qos::configure_sync_worker("sync");
 			let runner = SyncRunner::new(sync_state, peers, chain, stop_state, sync_manager);
 			runner.sync_loop();
 		})
@@ -100,6 +101,7 @@ impl SyncRunner {
 			// * we are synced already, e.g. mwc was quickly restarted
 			// * timeout
 			if wp >= MIN_PEERS || n > wait_secs {
+				info!("body sync discovery startup_wait_s={} qualifying_outbound={} target={} timeout={}", n, wp, MIN_PEERS, wp < MIN_PEERS);
 				break;
 			}
 			thread::sleep(time::Duration::from_secs(1));
@@ -197,6 +199,11 @@ impl SyncRunner {
 				}
 				SyncRequestResponses::SyncDone => {
 					self.sync_state.update(SyncStatus::NoSync);
+					if let Err(e) = self.chain.advance_rolling_checkpoint(
+						!self.stop_state.is_stopped() && self.peers.iter().connected().count() > 0
+					) {
+						error!("Rolling checkpoint maintenance failed: {}", e);
+					}
 					// reset the boost mode
 					self.peers
 						.set_boost_peers_capabilities(Capabilities::UNKNOWN);

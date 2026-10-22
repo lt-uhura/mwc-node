@@ -1037,6 +1037,9 @@ impl ArtiCore {
 
 		// Special runtime for the atri client. Needed because we will need to shutdown RT in order to stop the client.
 		let arti_rt = tokio::runtime::Builder::new_multi_thread()
+			.on_thread_start(|| {
+				mwc_util::worker_qos::configure_sync_worker("arti_runtime");
+			})
 			.enable_all()
 			.build()
 			.map_err(|e| Error::Internal(format!("failed to start Tokio runtime, {}", e)))?;

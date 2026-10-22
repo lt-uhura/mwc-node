@@ -23,13 +23,14 @@ use mwc_core::core::hash::{Hash, Hashed, ZERO_HASH};
 use mwc_core::core::{Block, BlockHeader};
 use mwc_core::pow::Difficulty;
 use mwc_core::ser::{self, Readable, Reader, Writeable, Writer};
-use mwc_crates::log::{debug, info};
+use mwc_crates::log::{debug, info, warn};
 use mwc_crates::parking_lot::{RwLock, RwLockWriteGuard};
 use mwc_crates::secp::pedersen::Commitment;
 use mwc_crates::secp::Secp256k1;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::convert::TryFrom;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 bitflags! {
@@ -46,6 +47,106 @@ bitflags! {
 		const SYNC = 0b0000_0010;
 		/// Block validation on a block we mined ourselves
 		const MINE = 0b0000_0100;
+	}
+}
+
+thread_local! {
+	static IN_SYNC_BLOCK_APPLY: Cell<bool> = const { Cell::new(false) };
+}
+
+static LEFTOVER_PRUNE_LOG_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static LEFTOVER_PRUNE_LOG_SECS: AtomicU64 = AtomicU64::new(0);
+static LEFTOVER_PRUNE_RECOVERY: AtomicBool = AtomicBool::new(false);
+static HEADER_ANCESTRY_VALIDATED_THIS_PROCESS: AtomicBool = AtomicBool::new(false);
+static SKIP_PROCESS_BLOCK_HEADER_ANCESTRY: AtomicBool = AtomicBool::new(false);
+
+/// Marks the current thread as applying a block with `Options::SYNC` so leftover-prune
+/// Info logs share the 50-height / 10s rate limit used by `Accepted multiple blocks`.
+pub(crate) struct SyncApplyLogGuard {
+	prev: bool,
+}
+
+impl SyncApplyLogGuard {
+	pub(crate) fn enter(opts: Options) -> Self {
+		let prev = IN_SYNC_BLOCK_APPLY.with(|c| c.replace(opts.contains(Options::SYNC)));
+		Self { prev }
+	}
+}
+
+impl Drop for SyncApplyLogGuard {
+	fn drop(&mut self) {
+		IN_SYNC_BLOCK_APPLY.with(|c| c.set(self.prev));
+	}
+}
+
+pub(crate) fn mark_leftover_prune_recovery() {
+	LEFTOVER_PRUNE_RECOVERY.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn leftover_prune_recovery_active() -> bool {
+	LEFTOVER_PRUNE_RECOVERY.load(Ordering::Relaxed)
+}
+
+pub(crate) fn mark_header_ancestry_validated() {
+	HEADER_ANCESTRY_VALIDATED_THIS_PROCESS.store(true, Ordering::SeqCst);
+}
+
+pub(crate) fn header_ancestry_validated_this_process() -> bool {
+	HEADER_ANCESTRY_VALIDATED_THIS_PROCESS.load(Ordering::SeqCst)
+}
+
+pub(crate) fn set_skip_process_block_header_ancestry(skip: bool) {
+	SKIP_PROCESS_BLOCK_HEADER_ANCESTRY.store(skip, Ordering::SeqCst);
+}
+
+pub(crate) fn skip_process_block_header_ancestry() -> bool {
+	SKIP_PROCESS_BLOCK_HEADER_ANCESTRY.load(Ordering::SeqCst)
+}
+
+/// Overlay / leftover ProcessBlock: header PMMR can sit at millions while
+/// BODY_HEAD is genesis (0) or far behind. Re-walking header ancestry cannot
+/// repair start and used to hang/fail create_server.
+pub(crate) fn should_skip_process_block_ancestry_on_mobile(
+	header_head_height: u64,
+	body_head_height: u64,
+) -> bool {
+	if !cfg!(any(target_os = "ios", target_os = "android")) {
+		return false;
+	}
+	if header_ancestry_validated_this_process() {
+		return true;
+	}
+	// Include BODY_HEAD == 0 (overlay / PMMR-behind-headers). Do not require
+	// body_head_height > 0; that missed the overlay-install start path.
+	header_head_height >= 3_000_000 && header_head_height > body_head_height
+}
+
+pub(crate) fn log_skip_process_block_ancestry() {
+	warn!("skipping repeated ProcessBlock ancestry recovery on mobile");
+}
+
+/// Rate-limit leftover-prune Info logs during Options::SYNC (every 50 heights or 10s).
+pub(crate) fn leftover_prune_sync_log_ok(height: u64) -> bool {
+	if !IN_SYNC_BLOCK_APPLY.with(|c| c.get()) {
+		return true;
+	}
+	let now_secs = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0);
+	let last_height = LEFTOVER_PRUNE_LOG_HEIGHT.load(Ordering::Relaxed);
+	let last_secs = LEFTOVER_PRUNE_LOG_SECS.load(Ordering::Relaxed);
+	if height.saturating_sub(last_height) < 50 && now_secs.saturating_sub(last_secs) < 10 {
+		return false;
+	}
+	LEFTOVER_PRUNE_LOG_HEIGHT.store(height, Ordering::Relaxed);
+	LEFTOVER_PRUNE_LOG_SECS.store(now_secs, Ordering::Relaxed);
+	true
+}
+
+pub(crate) fn leftover_prune_info(height: u64, args: std::fmt::Arguments<'_>) {
+	if leftover_prune_sync_log_ok(height) {
+		info!("{}", args);
 	}
 }
 

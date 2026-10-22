@@ -144,7 +144,7 @@ impl Server {
 	pub fn create_server(
 		secp: &Secp256k1,
 		context_id: u32,
-		config: ServerConfig,
+		mut config: ServerConfig,
 		stop_state: Arc<StopState>,
 		skip_start_blockchain_validation: bool,
 	) -> Result<Self, Error> {
@@ -238,6 +238,13 @@ impl Server {
 			None => HashSet::new(),
 		};
 
+		// The exclusive directory lock above is held. This is only requested by
+		// an explicit user action, never as a fallback to a failed startup.
+		if config.clear_local_checkpoint_on_start {
+			mwc_chain::ChainStore::clear_local_checkpoint_before_open(context_id, &config.db_root)
+				.map_err(|e| Error::ServerError(format!("Unable to remove local checkpoint: {}", e)))?;
+			config.clear_local_checkpoint_on_start = false;
+		}
 		let shared_chain = Arc::new(
 			mwc_chain::Chain::init(
 				secp,
@@ -817,27 +824,10 @@ impl Server {
 			total_difficulty: header.total_difficulty(),
 		};
 
-		let disk_usage_bytes = WalkDir::new(&self.config.db_root)
+		let disk_usage_bytes = disk_usage_entries(WalkDir::new(&self.config.db_root)
 			.min_depth(1)
 			.max_depth(3)
-			.into_iter()
-			.try_fold(0_u64, |acc, entry| -> Result<u64, Error> {
-				let entry = entry
-					.map_err(|e| Error::ServerError(format!("Disk usage walk error, {}", e)))?;
-				let metadata = entry.metadata().map_err(|e| {
-					Error::ServerError(format!(
-						"Disk usage metadata access error for {}, {}",
-						entry.path().display(),
-						e
-					))
-				})?;
-
-				if metadata.is_file() {
-					Ok(acc.saturating_add(metadata.len()))
-				} else {
-					Ok(acc)
-				}
-			})?;
+			.into_iter())?;
 
 		let disk_usage_gb = format!("{:.*}", 3, (disk_usage_bytes as f64 / 1_000_000_000_f64));
 
@@ -941,9 +931,63 @@ fn build_tls_config(config: &ServerConfig) -> Result<Option<TLSConfig>, Error> {
 	}
 }
 
+// Advisory size of a live directory, not a transactional filesystem snapshot.
+// A child can disappear after enumeration when PMMR temp files are renamed.
+fn disk_usage_entries(entries: impl IntoIterator<Item = Result<mwc_crates::walkdir::DirEntry, mwc_crates::walkdir::Error>>) -> Result<u64, Error> {
+	let mut total = 0u64;
+	for entry in entries {
+		let entry = match entry {
+			Ok(entry) => entry,
+			Err(e) if e.depth() > 0 && e.io_error().map_or(false, |e| e.kind() == std::io::ErrorKind::NotFound) => continue,
+			Err(e) => return Err(Error::ServerError(format!("Disk usage walk error, {}", e))),
+		};
+		let size = disk_usage_metadata(entry.metadata().map_err(|e| {
+			let kind = e.io_error().map_or(std::io::ErrorKind::Other, |e| e.kind());
+			std::io::Error::new(kind, e)
+		})).map_err(|e| Error::ServerError(format!("Disk usage metadata access error for {}, {}", entry.path().display(), e)))?;
+		total = total.saturating_add(size);
+	}
+	Ok(total)
+}
+
+fn disk_usage_metadata(metadata: std::io::Result<fs::Metadata>) -> std::io::Result<u64> {
+	match metadata {
+		Ok(metadata) => Ok(if metadata.is_file() { metadata.len() } else { 0 }),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+		Err(e) => Err(e),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn disk_usage_tolerates_file_renamed_after_enumeration() {
+		let dir = mwc_crates::tempfile::TempDir::new().unwrap();
+		let temporary = dir.path().join("pmmr_leaf.bin.tmp.123");
+		fs::write(&temporary, b"pending").unwrap();
+		fs::write(dir.path().join("stable"), b"abcd").unwrap();
+		let entries: Vec<_> = WalkDir::new(dir.path()).min_depth(1).max_depth(3).into_iter().collect();
+		fs::rename(&temporary, dir.path().join("pmmr_leaf.bin")).unwrap();
+		assert_eq!(disk_usage_entries(entries).unwrap(), 4);
+		assert_eq!(disk_usage_entries(WalkDir::new(dir.path()).min_depth(1).max_depth(3)).unwrap(), 11);
+	}
+
+	#[test]
+	fn disk_usage_preserves_non_missing_metadata_errors() {
+		for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::Other] {
+			let result = disk_usage_metadata(Err(std::io::Error::new(kind, "test failure")));
+			assert_eq!(result.unwrap_err().kind(), kind);
+		}
+		assert_eq!(disk_usage_metadata(Err(std::io::Error::from(std::io::ErrorKind::NotFound))).unwrap(), 0);
+	}
+
+	#[test]
+	fn disk_usage_missing_root_is_not_silently_zero() {
+		let dir = mwc_crates::tempfile::TempDir::new().unwrap();
+		assert!(disk_usage_entries(WalkDir::new(dir.path().join("absent")).min_depth(1)).is_err());
+	}
 
 	#[cfg(unix)]
 	#[test]

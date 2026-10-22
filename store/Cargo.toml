@@ -10,7 +10,11 @@ workspace = ".."
 edition = "2024"
 
 [dependencies]
-mwc_crates = { path = "../mwc_crates", version = "7.1.0" }
+mwc_crates = { path = "../mwc_crates", version = "7.1.0", default-features = false }
 mwc_core = { path = "../core", version = "7.1.0" }
 mwc_util = { path = "../util", version = "7.1.0" }
 thiserror.workspace = true
+
+[features]
+# Exercise the iOS positional PMMR backend in native regression tests.
+test-ios-storage = []

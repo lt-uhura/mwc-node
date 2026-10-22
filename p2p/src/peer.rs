@@ -97,6 +97,11 @@ impl fmt::Debug for Peer {
 }
 
 impl Peer {
+	/// Construct a socket-free peer for ownership regression tests.
+	#[cfg(feature = "test-support")]
+	pub fn for_ownership_test(info: PeerInfo, adapter: Arc<dyn NetAdapter>, context_id: u32) -> Peer {
+		Self::new(info, adapter, context_id)
+	}
 	// Only accept and connect can be externally used to build a peer
 	fn new(info: PeerInfo, adapter: Arc<dyn NetAdapter>, context_id: u32) -> Peer {
 		let state = Arc::new(RwLock::new(State::Connected));

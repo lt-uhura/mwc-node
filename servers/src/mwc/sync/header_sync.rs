@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 const HEADERS_SERIES_CACHE_MAX_LEN: usize = 1000;
 const HEADERS_SERIES_CACHE_MAX_HEADERS: usize = 20_000;
+const MAP_FULL_HEADER_SYNC_BACKOFF: Duration = Duration::from_secs(30);
 
 type HeadersSeriesCache = HashMap<(PeerAddr, Hash), (Vec<BlockHeader>, Instant)>;
 
@@ -133,6 +134,20 @@ impl HeaderSync {
 		return Capabilities::HEADER_HIST;
 	}
 
+	fn map_full_backoff_response(&self) -> Result<SyncResponse, mwc_chain::Error> {
+		self.chain.note_storage_map_full("header_sync");
+		let resp = SyncResponse::new(
+			SyncRequestResponses::WaitingForHeaders,
+			Self::get_peer_capabilities(),
+			"LMDB map is full; header sync paused until node restart".into(),
+		);
+		*self.cached_response.write() = Some(CachedResponse::new(
+			resp.clone(),
+			MAP_FULL_HEADER_SYNC_BACKOFF,
+		)?);
+		Ok(resp)
+	}
+
 	fn ensure_received_cache(
 		&self,
 		headers_hash_desegmenter: &HeaderHashesDesegmenter,
@@ -201,6 +216,10 @@ impl HeaderSync {
 			}
 		}
 
+		if self.chain.storage_writes_frozen() {
+			return self.map_full_backoff_response();
+		}
+
 		let header_head = self
 			.chain
 			.header_head()
@@ -255,6 +274,10 @@ impl HeaderSync {
 				// First checking if some headers need to be uploaded to the chain.
 				let has_more_data = match self.try_apply_received_cache(received_cache) {
 					Some(Ok(has_more_data)) => has_more_data,
+					Some(Err((peer, err))) if err.is_lmdb_map_full() => {
+						let _ = peer;
+						return self.map_full_backoff_response();
+					}
 					Some(Err((Some(peer), err))) => {
 						let msg =
 							format!("Failed to process add_headers for {}. Error: {}", peer, err);
@@ -428,6 +451,11 @@ impl HeaderSync {
 	) -> Result<(), mwc_chain::Error> {
 		debug_assert!(!bhs.is_empty());
 
+		if self.chain.storage_writes_frozen() {
+			self.chain.note_storage_map_full("receive_headers");
+			return Ok(());
+		}
+
 		let series_key = (
 			peer.clone(),
 			bhs.first()
@@ -582,7 +610,9 @@ impl HeaderSync {
 							if matched_request {
 								sync_peers.report_ok_response(peer);
 							}
-							if registered_peer.is_some() {
+							if registered_peer.is_some()
+								&& !self.chain.storage_writes_frozen()
+							{
 								self.request_more_pibd_headers(
 									Some(header_hashes_desegmenter),
 									peers,
@@ -602,6 +632,12 @@ impl HeaderSync {
 							);
 							error!("{}", msg);
 							sync_peers.report_error_response(&bad_peer, msg);
+							if err.is_lmdb_map_full() {
+								self.chain.note_storage_map_full(
+									"receive_headers add_headers_to_cache",
+								);
+								return Ok(());
+							}
 							if matched_request {
 								self.request_more_pibd_headers(
 									Some(header_hashes_desegmenter),
@@ -677,6 +713,10 @@ impl HeaderSync {
 				}
 			}
 			Err(e) => {
+				if e.is_lmdb_map_full() {
+					self.chain.note_storage_map_full("receive_headers sync_block_headers");
+					return Ok(());
+				}
 				debug!("Headers refused by chain: {:?}", e);
 				if e.is_bad_data() {
 					let _ = self.request_tracker.remove_request(&request_key, peer);

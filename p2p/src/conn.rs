@@ -371,6 +371,7 @@ where
 	let reader_thread = thread::Builder::new()
 		.name(format!("peer_read_{}", peer_name1))
 		.spawn(move || -> Result<(), Error> {
+			mwc_util::worker_qos::configure_sync_worker("peer_read");
 			let _stop_on_drop = StopOnDrop {
 				stopped: reader_stopped.clone(),
 			};
@@ -471,6 +472,7 @@ where
 	let writer_thread = match thread::Builder::new()
 		.name(format!("peer_write_{}", peer_name))
 		.spawn(move || -> Result<(), Error> {
+			mwc_util::worker_qos::configure_sync_worker("peer_write");
 			let _stop_on_drop = StopOnDrop {
 				stopped: writer_stopped.clone(),
 			};

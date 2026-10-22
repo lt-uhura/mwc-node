@@ -24,6 +24,8 @@ pub mod id;
 pub mod merkle_proof;
 pub mod pmmr;
 pub mod transaction;
+#[cfg(any(target_os = "ios", test, feature = "test-proof-cache"))]
+mod proof_cache;
 
 pub use self::block::*;
 pub use self::block_sums::*;

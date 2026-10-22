@@ -447,10 +447,21 @@ fn is_kernel_pmmr_version_probe_error(err: &Error) -> bool {
 impl PMMRHandle<BlockHeader> {
 	/// Used during chain init to ensure the header PMMR is consistent with header_head in the db.
 	pub fn init_head(&mut self, head: &Tip) -> Result<(), Error> {
-		let head_hash = self.head_hash()?;
-		let expected_hash = self.get_header_hash_by_height(head.height)?;
 		let context_id = self.backend.get_context_id();
 		let head_tip_hash = head.hash(context_id)?;
+		// Do not require reading the file-tip leaf. A crash can leave a
+		// speculative suffix whose last leaf is unreadable; HEADER_HEAD is the
+		// durable target. Missing height => leave size unchanged.
+		let expected_hash = match self.get_header_hash_by_height(head.height) {
+			Ok(h) => h,
+			Err(e) => {
+				warn!(
+					"init_head: header PMMR cannot read height {} (size {}); leaving size unchanged: {}",
+					head.height, self.size, e
+				);
+				return Ok(());
+			}
+		};
 		if head_tip_hash != expected_hash {
 			error!(
 				"header PMMR inconsistent: {} vs {} at {}",
@@ -459,19 +470,14 @@ impl PMMRHandle<BlockHeader> {
 			return Err(Error::Other("header PMMR inconsistent".to_string()));
 		}
 
-		// use next header pos to find our size.
 		let next_height = head.height.checked_add(1).ok_or_else(|| {
 			Error::DataOverflow(format!("PMMRHandle::init_head, height={}", head.height))
 		})?;
 		let size = pmmr::insertion_to_pmmr_index(next_height)?;
 
 		debug!(
-			"init_head: header PMMR: current head {} at pos {}",
-			head_hash, self.size
-		);
-		debug!(
-			"init_head: header PMMR: resetting to {} at pos {} (height {})",
-			head_tip_hash, size, head.height
+			"init_head: header PMMR: resetting to {} at pos {} (height {}), previous size {}",
+			head_tip_hash, size, head.height, self.size
 		);
 
 		self.size = size;
@@ -2266,6 +2272,7 @@ where
 	extending_with_head(header_pmmr, trees, batch, head, inner)
 }
 
+
 /// Starts a new unit of work using an explicit body head for the extension.
 ///
 /// This is for callers such as PIBD finalization where the txhashset PMMRs have
@@ -2349,37 +2356,42 @@ where
 						"extending commit",
 					);
 				}
-				if let Err(e) = trees.output_pmmr_h.backend.sync() {
-					let sync_err = Error::PmmrSyncStateUncertain {
-						context: "extending output sync".to_owned(),
-						source: e,
-					};
-					return result_with_discard(
-						Err(sync_err),
-						discard_txhashset_backends(trees),
-						"extending output sync",
-					);
+				// Flush output, rangeproof, and kernel together. Do not persist one
+				// MMR without the others: a partial flush leaves HEAD/PMMR mismatched.
+				// If any hard-fails, rewind all three back to the pre-extension sizes
+				// and leave handle sizes unchanged.
+				let old_out = trees.output_pmmr_h.size;
+				let old_rproof = trees.rproof_pmmr_h.size;
+				let old_kern = trees.kernel_pmmr_h.size;
+				let mut sync_timing = mwc_util::sync_diagnostics::Metric::ExtensionSync.start();
+				let output_sync = trees.output_pmmr_h.backend.sync();
+				let rproof_sync = trees.rproof_pmmr_h.backend.sync();
+				let kernel_sync = trees.kernel_pmmr_h.backend.sync();
+				if output_sync.is_ok() && rproof_sync.is_ok() && kernel_sync.is_ok() {
+					sync_timing.success();
 				}
-				if let Err(e) = trees.rproof_pmmr_h.backend.sync() {
-					let sync_err = Error::PmmrSyncStateUncertain {
-						context: "extending rangeproof sync".to_owned(),
-						source: e,
+				drop(sync_timing);
+				let classify = |res: Result<(), io::Error>, what: &str| -> Result<(), Error> {
+					res.map_err(|source| Error::PmmrSyncStateUncertain {
+						context: format!("extending {} sync", what), source,
+					})
+				};
+				let output_res = classify(output_sync, "output");
+				let rproof_res = classify(rproof_sync, "rangeproof");
+				let kernel_res = classify(kernel_sync, "kernel");
+				if output_res.is_err() || rproof_res.is_err() || kernel_res.is_err() {
+					let empty = Bitmap::new();
+					let _ = trees.output_pmmr_h.backend.rewind(old_out, &empty);
+					let _ = trees.rproof_pmmr_h.backend.rewind(old_rproof, &empty);
+					let _ = trees.kernel_pmmr_h.backend.rewind(old_kern, &empty);
+					let first_err = match (output_res, rproof_res, kernel_res) {
+						(Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => e,
+						(Ok(()), Ok(()), Ok(())) => unreachable!("checked is_err above"),
 					};
 					return result_with_discard(
-						Err(sync_err),
+						Err(first_err),
 						discard_txhashset_backends(trees),
-						"extending rangeproof sync",
-					);
-				}
-				if let Err(e) = trees.kernel_pmmr_h.backend.sync() {
-					let sync_err = Error::PmmrSyncStateUncertain {
-						context: "extending kernel sync".to_owned(),
-						source: e,
-					};
-					return result_with_discard(
-						Err(sync_err),
-						discard_txhashset_backends(trees),
-						"extending kernel sync",
+						"extending pmmr sync",
 					);
 				}
 				trees.output_pmmr_h.size = sizes.0;
@@ -2510,13 +2522,10 @@ where
 				}
 				if let Err(e) = handle.backend.sync() {
 					let sync_err = Error::PmmrSyncStateUncertain {
-						context: "header_extending sync".to_owned(),
-						source: e,
+						context: "header_extending sync".to_owned(), source: e,
 					};
 					return result_with_discard(
-						Err(sync_err),
-						handle.backend.discard(),
-						"header_extending sync",
+						Err(sync_err), handle.backend.discard(), "header_extending sync",
 					);
 				}
 				handle.size = size;
@@ -2748,10 +2757,13 @@ impl<'a> HeaderExtension<'a> {
 			&started,
 		);
 		match &result {
-			Ok(()) => info!(
-				"validate_persisted_ancestry: finished successfully in {}s",
-				started.elapsed().as_secs()
-			),
+			Ok(()) => {
+				crate::types::mark_header_ancestry_validated();
+				info!(
+					"validate_persisted_ancestry: finished successfully in {}s",
+					started.elapsed().as_secs()
+				);
+			}
 			Err(err) => error!(
 				"validate_persisted_ancestry: stopped with error after {}s: {:?}",
 				started.elapsed().as_secs(),
@@ -2764,6 +2776,7 @@ impl<'a> HeaderExtension<'a> {
 	fn validate_persisted_ancestry_inner(
 		&self,
 		header: &BlockHeader,
+
 		batch: &Batch<'_>,
 		pow_verifier: fn(u32, &BlockHeader) -> Result<(), mwc_core::pow::Error>,
 		stop_state: Option<&StopState>,
@@ -2795,6 +2808,14 @@ impl<'a> HeaderExtension<'a> {
 				header.height,
 				expected_size
 			)));
+		}
+
+		if crate::types::skip_process_block_header_ancestry()
+			|| (cfg!(any(target_os = "ios", target_os = "android"))
+				&& crate::types::header_ancestry_validated_this_process())
+		{
+			crate::types::log_skip_process_block_ancestry();
+			return Ok(());
 		}
 
 		let leaf_capacity = usize::try_from(next_height).map_err(|_| {
@@ -3121,13 +3142,47 @@ impl<'a> Extension<'a> {
 		header_ext: &HeaderExtension<'_>,
 		batch: &Batch<'_>,
 	) -> Result<Vec<(Commitment, SpentCommitmentRecord)>, Error> {
-		let mut affected_pos = vec![];
-
 		// Resolve spent outputs before adding any new outputs from this block.
 		// Inputs must be validated against the pre-block UTXO set.
 		let spent = self
 			.utxo_view(header_ext)
 			.validate_inputs(&b.inputs(), batch)?;
+		self.apply_block_with_spent(b, batch, spent)
+	}
+
+	/// Validate and consume pre-block UTXOs in one scope. The callback may verify
+	/// sums, but cannot mutate this extension between resolution and application.
+	/// It must not change output-position or spent-record DB state either; the
+	/// series caller only verifies and saves block sums in this interval.
+	/// Resolved positions never escape or become a cache across blocks or forks.
+	pub(crate) fn validate_and_apply_block<F>(
+		&mut self,
+		b: &Block,
+		header_ext: &HeaderExtension<'_>,
+		batch: &Batch<'_>,
+		before_apply: F,
+	) -> Result<Vec<(Commitment, SpentCommitmentRecord)>, Error>
+	where
+		F: FnOnce() -> Result<(), Error>,
+	{
+		let spent = self.utxo_view(header_ext).validate_block(b, batch)?;
+		before_apply()?;
+		let mut timing = mwc_util::sync_diagnostics::Metric::ExtensionApply.start();
+		let records = self.apply_block_with_spent(b, batch, spent)?;
+		self.validate_roots(&b.header)?;
+		self.validate_sizes(&b.header)?;
+		timing.success();
+		Ok(records)
+	}
+
+	// Only called after input validation against this unchanged extension.
+	fn apply_block_with_spent(
+		&mut self,
+		b: &Block,
+		batch: &Batch<'_>,
+		spent: Vec<(OutputIdentifier, CommitPos)>,
+	) -> Result<Vec<(Commitment, SpentCommitmentRecord)>, Error> {
+		let mut affected_pos = vec![];
 		let mut spent_records = Vec::with_capacity(spent.len());
 		let b_hash = b.hash(self.context_id)?;
 
@@ -3137,6 +3192,8 @@ impl<'a> Extension<'a> {
 		for out in b.outputs() {
 			let pos = self.apply_output(out, batch)?;
 			affected_pos.push(pos);
+			// Always overwrite. Leftover rows from a pre-rebuild apply can
+			// point at stale PMMR positions; keeping them would fail later spends.
 			batch.save_output_pos_height(
 				&out.commitment(),
 				CommitPos {
@@ -3208,7 +3265,47 @@ impl<'a> Extension<'a> {
 				}
 				Ok(())
 			}
-			false => Err(Error::AlreadySpent(commit)),
+			false => match self.output_pmmr.get_data_from_file(pos0)? {
+				// Leaf already pruned from a pre-reset apply of this same spend.
+				Some(out) if out.commitment() == commit => {
+					crate::types::mark_leftover_prune_recovery();
+					if crate::types::leftover_prune_sync_log_ok(self.head.height) {
+						info!(
+							"already-spent index leftover for commitment {:?}; treating as unspent in current PMMR",
+							commit
+						);
+					}
+					let _ = self.rproof_pmmr.prune(pos0)?;
+					Ok(())
+				}
+				_ => {
+					// Indexed pos missing or wrong after a rolled-back leftover apply
+					// deleted output_pos. Recover the leaf from the PMMR file.
+					if let Some((_, found_pos0)) = super::find_output_including_pruned(
+						&self.output_pmmr.readonly_pmmr(),
+						&commit,
+					)? {
+						crate::types::mark_leftover_prune_recovery();
+						let found_pos1 = found_pos0.checked_add(1).ok_or_else(|| {
+							Error::DataOverflow(format!(
+								"Extension::apply_input found_pos0={}",
+								found_pos0
+							))
+						})?;
+						crate::types::leftover_prune_info(
+							self.head.height,
+							format_args!(
+								"already-spent leftover with no output_pos; recovered from PMMR file at pos {}",
+								found_pos1
+							),
+						);
+						let _ = self.output_pmmr.prune(found_pos0)?;
+						let _ = self.rproof_pmmr.prune(found_pos0)?;
+						return Ok(());
+					}
+					Err(Error::AlreadySpent(commit))
+				}
+			},
 		}
 	}
 
@@ -3220,20 +3317,24 @@ impl<'a> Extension<'a> {
 				Some(out_mmr) if out_mmr.commitment() == commit => {
 					return Err(Error::DuplicateCommitment(commit));
 				}
-				Some(out_mmr) => {
-					return Err(Error::TxHashSetErr(format!(
-						"output_pos index mismatch for commitment {:?}: index points to {:?} at pos {}",
-						commit,
-						out_mmr.commitment(),
-						pos0 + 1 // pos0+1 is acceptable because it is an error message
-					)));
-				}
-				None => {
-					return Err(Error::TxHashSetErr(format!(
-						"output_pos index points to missing output at pos {} for commitment {:?}",
-						pos0 + 1, // pos0+1 is acceptable because it is an error message
-						commit
-					)));
+				Some(_) | None => {
+					let stale_pos1 = pos0.checked_add(1).ok_or_else(|| {
+						Error::DataOverflow(format!("Extension::apply_output stale pos0={}", pos0))
+					})?;
+					if crate::types::leftover_prune_sync_log_ok(self.head.height) {
+						info!(
+							"output_pos stale at pos {} for commitment {:?}; looking up in current PMMR",
+							stale_pos1, commit
+						);
+					}
+					if super::find_unspent_output_by_commitment(
+						&self.output_pmmr.readonly_pmmr(),
+						&commit,
+					)?
+					.is_some()
+					{
+						return Err(Error::DuplicateCommitment(commit));
+					}
 				}
 			},
 			Err(e) if e.store_error_is_not_found() => {}
@@ -4086,7 +4187,9 @@ impl<'a> Extension<'a> {
 					if out.commitment() != spent_output.commitment {
 						return Err(Error::InvalidPersistedChainState(format!(
 							"rewind_single_block restored output commitment {:?} at position {}, expected {:?}",
-							out.commitment(), pos1.pos, spent_output.commitment
+							out.commitment(),
+							pos1.pos,
+							spent_output.commitment
 						)));
 					}
 					batch.save_output_pos_height(&spent_output.commitment, pos1)?;
@@ -4105,6 +4208,37 @@ impl<'a> Extension<'a> {
 		}
 
 		Ok(())
+	}
+
+	/// Truncate any body MMR that is ahead of `header` back to that header's
+	/// sizes. Backward rewind is legal; rewind-forward is rejected. Spent
+	/// leaves are not restored: this recovers an interrupted ProcessBlock that
+	/// flushed a prefix of one MMR without the others.
+	pub(crate) fn rewind_ahead_mmrs_to_header(
+		&mut self,
+		header: &BlockHeader,
+	) -> Result<bool, Error> {
+		let out = self.output_pmmr.size();
+		let kern = self.kernel_pmmr.size();
+		let rproof = self.rproof_pmmr.size();
+		let ahead = out > header.output_mmr_size
+			|| kern > header.kernel_mmr_size
+			|| rproof > header.output_mmr_size;
+		if !ahead {
+			return Ok(false);
+		}
+		if header.output_mmr_size > out
+			|| header.kernel_mmr_size > kern
+			|| header.output_mmr_size > rproof
+		{
+			return Err(Error::TxHashSetErr(format!(
+				"cannot rewind PMMR forward from output/kernel {}/{} to {}/{}",
+				out, kern, header.output_mmr_size, header.kernel_mmr_size
+			)));
+		}
+		self.rewind_mmrs_to_pos(header.output_mmr_size, header.kernel_mmr_size, &[])?;
+		self.head = Tip::try_from_header(header)?;
+		Ok(true)
 	}
 
 	/// Rewinds the MMRs to the provided positions, given the output and
@@ -6877,9 +7011,10 @@ mod tests {
 	}
 
 	#[test]
-	fn apply_output_rejects_output_pos_index_commitment_mismatch() {
+	fn apply_output_overwrites_stale_output_pos_when_index_points_at_other_commitment() {
 		global::set_local_chain_type(ChainTypes::AutomatedTesting);
-		let chain_dir = "target/apply_output_rejects_output_pos_index_commitment_mismatch";
+		let chain_dir =
+			"target/apply_output_overwrites_stale_output_pos_when_index_points_at_other_commitment";
 		let _ = fs::remove_dir_all(chain_dir);
 		let store = Arc::new(ChainStore::new(0, chain_dir).unwrap());
 		let secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
@@ -6924,11 +7059,17 @@ mod tests {
 
 			let err = extension.apply_output(&output, &batch).unwrap_err();
 			match err {
-				Error::TxHashSetErr(msg) => {
-					assert!(msg.contains("output_pos index mismatch"), "{}", msg);
-				}
-				other => panic!("expected output_pos mismatch error, got {:?}", other),
+				Error::Other(msg) => assert!(
+					msg.contains("output vs rproof MMRs different sizes"),
+					"stale index must be ignored so apply proceeds to MMR push, got {}",
+					msg
+				),
+				other => panic!(
+					"expected to pass stale output_pos check and hit rproof size mismatch, got {:?}",
+					other
+				),
 			}
+			let _ = pos;
 		}
 
 		drop(txhashset);
@@ -6937,9 +7078,9 @@ mod tests {
 	}
 
 	#[test]
-	fn apply_output_rejects_output_pos_index_missing_mmr_data() {
+	fn apply_output_overwrites_stale_output_pos_when_mmr_data_missing() {
 		global::set_local_chain_type(ChainTypes::AutomatedTesting);
-		let chain_dir = "target/apply_output_rejects_output_pos_index_missing_mmr_data";
+		let chain_dir = "target/apply_output_overwrites_stale_output_pos_when_mmr_data_missing";
 		let _ = fs::remove_dir_all(chain_dir);
 		let store = Arc::new(ChainStore::new(0, chain_dir).unwrap());
 		let secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
@@ -6964,17 +7105,42 @@ mod tests {
 				RangeProof::zero(),
 			);
 
-			let err = extension.apply_output(&output, &batch).unwrap_err();
-			match err {
-				Error::TxHashSetErr(msg) => {
-					assert!(
-						msg.contains("output_pos index points to missing output"),
-						"{}",
-						msg
-					);
-				}
-				other => panic!("expected missing output_pos target error, got {:?}", other),
-			}
+			let pos = extension.apply_output(&output, &batch).unwrap();
+			assert_eq!(pos, 1);
+		}
+
+		drop(txhashset);
+		drop(store);
+		let _ = fs::remove_dir_all(chain_dir);
+	}
+
+	#[test]
+	fn apply_input_accepts_leftover_prune_from_prior_apply() {
+		global::set_local_chain_type(ChainTypes::AutomatedTesting);
+		let chain_dir = "target/apply_input_accepts_leftover_prune_from_prior_apply";
+		let _ = fs::remove_dir_all(chain_dir);
+		let store = Arc::new(ChainStore::new(0, chain_dir).unwrap());
+		let secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+		let mut txhashset =
+			TxHashSet::open(chain_dir.to_string(), store.clone(), None, &secp).unwrap();
+
+		let commit = secp.commit_value(1).unwrap();
+		let output = Output::new(
+			mwc_core::core::OutputFeatures::Plain,
+			commit,
+			RangeProof::zero(),
+		);
+
+		{
+			let batch = store.batch_read().unwrap();
+			let mut extension = Extension::new(0, &mut txhashset, Tip::default());
+			let pos = extension.apply_output(&output, &batch).unwrap();
+			let pos0 = pos.checked_sub(1).unwrap();
+			assert!(extension.output_pmmr.prune(pos0).unwrap());
+			assert!(extension.rproof_pmmr.prune(pos0).unwrap());
+			extension
+				.apply_input(commit, CommitPos { pos, height: 0 })
+				.expect("leftover prune of this spend must apply");
 		}
 
 		drop(txhashset);
@@ -7030,6 +7196,47 @@ mod tests {
 				Error::AlreadySpent(c) => assert_eq!(c, commit),
 				other => panic!("expected missing pre-block input, got {:?}", other),
 			}
+
+			// The reuse path must also resolve against pre-block state, before
+			// either sums verification or indexing the newly created output.
+			let callback_ran = std::cell::Cell::new(false);
+			let sizes_before = extension.sizes();
+			let err = extension
+				.validate_and_apply_block(&block, &header_ext, &batch, || {
+					callback_ran.set(true);
+					Ok(())
+				})
+				.unwrap_err();
+			assert!(matches!(err, Error::AlreadySpent(c) if c == commit));
+			assert!(!callback_ran.get());
+			assert_eq!(extension.sizes(), sizes_before);
+
+			// A failed sums callback must not apply outputs or update extension
+			// head, even though UTXO validation has already succeeded.
+			let mut no_inputs = block.clone();
+			no_inputs.body = TransactionBody::init(
+				0,
+				Inputs::from([].as_slice() as &[Input]),
+				block.outputs(),
+				block.kernels(),
+				false,
+			)
+			.unwrap();
+			let head_before = extension.head();
+			let err = extension
+				.validate_and_apply_block(&no_inputs, &header_ext, &batch, || {
+					callback_ran.set(true);
+					Err(Error::Other("injected sums failure".into()))
+				})
+				.unwrap_err();
+			assert!(matches!(err, Error::Other(ref message) if message == "injected sums failure"));
+			assert!(callback_ran.get());
+			assert_eq!(extension.sizes(), sizes_before);
+			assert_eq!(extension.head(), head_before);
+			assert!(batch
+				.get_output_pos(&commit)
+				.unwrap_err()
+				.store_error_is_not_found());
 		}
 
 		drop(txhashset);

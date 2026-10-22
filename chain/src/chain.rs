@@ -121,6 +121,75 @@ impl From<Error> for BlockProcessingError {
 	}
 }
 
+/// Stored-body replay commits at most this many blocks per process_block_multiple.
+/// A shutdown mid-apply rolls back the whole uncommitted chunk, so 128 was too large
+/// (HEAD stayed on the prior height). After leftover-prune recovery is observed,
+/// subsequent commits are 1 so a single recovered block can land before stop.
+const STORED_BODY_COMMIT_BATCH: usize = 8;
+const STORED_BODY_COMMIT_BATCH_RECOVERY: usize = 1;
+
+fn stored_body_commit_batch() -> usize {
+	// iOS leftover-prune 290801 must land as a single block so one spend
+	// does not batch-extend the rangeproof PMMR.
+	if cfg!(any(target_os = "ios", target_os = "android"))
+		|| crate::types::leftover_prune_recovery_active()
+	{
+		STORED_BODY_COMMIT_BATCH_RECOVERY
+	} else {
+		STORED_BODY_COMMIT_BATCH
+	}
+}
+
+/// Rate-limit `Accepted multiple blocks` during SYNC so iOS CallbackAppender
+/// is not flooded (live body-sync and stored-body replay both use this path).
+fn log_accepted_multiple_blocks(opts: Options, from_height: u64, to_height: u64) {
+	if opts.contains(Options::SYNC) {
+		static LAST_HEIGHT: AtomicU64 = AtomicU64::new(0);
+		static LAST_SECS: AtomicU64 = AtomicU64::new(0);
+		let now_secs = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0);
+		let last_height = LAST_HEIGHT.load(Ordering::Relaxed);
+		let last_secs = LAST_SECS.load(Ordering::Relaxed);
+		if to_height.saturating_sub(last_height) < 50 && now_secs.saturating_sub(last_secs) < 10 {
+			return;
+		}
+		LAST_HEIGHT.store(to_height, Ordering::Relaxed);
+		LAST_SECS.store(now_secs, Ordering::Relaxed);
+	}
+	info!(
+		"Accepted multiple blocks from {} to {}",
+		from_height, to_height
+	);
+}
+
+fn unix_secs() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0)
+}
+
+/// Emit at most every `min_heights` or `min_secs` (whichever comes first).
+fn take_info_rate_limit(
+	last_height: &AtomicU64,
+	last_secs: &AtomicU64,
+	height: u64,
+	min_heights: u64,
+	min_secs: u64,
+) -> bool {
+	let now_secs = unix_secs();
+	let last_h = last_height.load(Ordering::Relaxed);
+	let last_s = last_secs.load(Ordering::Relaxed);
+	if height.saturating_sub(last_h) < min_heights && now_secs.saturating_sub(last_s) < min_secs {
+		return false;
+	}
+	last_height.store(height, Ordering::Relaxed);
+	last_secs.store(now_secs, Ordering::Relaxed);
+	true
+}
+
 /// Compare the portions of two block bodies committed by the header MMR roots.
 ///
 /// Inputs are intentionally excluded because a block header does not commit
@@ -404,6 +473,7 @@ pub struct Chain {
 	pibd_params: Arc<PibdParams>,
 	stop_state: Option<Arc<StopState>>,
 	requires_init_recovery: Arc<AtomicBool>,
+	recovery_in_progress: Arc<AtomicBool>,
 	pibd_state_generation: Arc<AtomicU64>,
 	#[cfg(test)]
 	fail_next_process_block_marker_clear: AtomicBool,
@@ -675,8 +745,31 @@ impl OutputReadSnapshot<'_> {
 }
 
 impl Chain {
+	/// Whether storage needs a safe close and reopen before sync can continue.
+	pub fn storage_writes_frozen(&self) -> bool {
+		self.store.writes_frozen()
+	}
+
+	/// Record map exhaustion for this chain environment only.
+	pub fn note_storage_map_full(&self, context: &str) {
+		self.store.note_map_full(context);
+	}
+
 	fn ensure_chain_robust(&self) -> Result<(), Error> {
+		// Re-entrancy: get_server_stats (~5s) and nested readers must not start
+		// a second 3.5M header ancestry walk while recovery holds write locks.
+		if self.recovery_in_progress.load(Ordering::SeqCst) {
+			return Ok(());
+		}
 		if self.requires_init_recovery.load(Ordering::SeqCst) {
+			if self.store.writes_frozen() {
+				// Recovery is still required; never report it complete without writes.
+				self.store
+					.note_map_full("ensure_chain_robust skip recover (chain env writes frozen)");
+				return Err(Error::Other(
+					"LMDB map is full; restart the node to grow the map".into(),
+				));
+			}
 			warn!("chain marked as requiring init recovery; attempting recovery before continuing");
 			self.recover_pending_chain_operation_checked("ensure_chain_robust")?;
 		}
@@ -689,7 +782,9 @@ impl Chain {
 	{
 		self.ensure_chain_robust()?;
 		loop {
+			let wait_started = Instant::now();
 			let header_pmmr = self.header_pmmr.read_recursive();
+			mwc_util::sync_diagnostics::record_header_wait(wait_started.elapsed());
 			if self.requires_init_recovery.load(Ordering::SeqCst) {
 				drop(header_pmmr);
 				self.ensure_chain_robust()?;
@@ -771,15 +866,26 @@ impl Chain {
 			)),
 			Ok(false) => {
 				self.requires_init_recovery.store(true, Ordering::SeqCst);
+				if self.store.writes_frozen() {
+					// Durable SyncHeaders marker may remain; do not retrigger recovery writes.
+					return Err(Error::Other(
+						"LMDB map is full; restart the node to grow the map".into(),
+					));
+				}
+				self.requires_init_recovery.store(true, Ordering::SeqCst);
 				Err(Error::Other(
 					"pending chain operation requires chain init recovery".into(),
 				))
 			}
 			Err(e) => {
+				let err: Error = e.into();
+				if err.is_lmdb_map_full() {
+					self.store.note_map_full("set_pending_chain_operation");
+				}
 				// A failed durable commit can have an uncertain outcome. Fail closed so
 				// the next top-level chain access checks for and recovers any marker.
 				self.requires_init_recovery.store(true, Ordering::SeqCst);
-				Err(e.into())
+				Err(err)
 			}
 		}
 	}
@@ -788,8 +894,12 @@ impl Chain {
 		match self.store.clear_pending_chain_operation() {
 			Ok(()) => Ok(()),
 			Err(e) => {
+				let err: Error = e.into();
+				if err.is_lmdb_map_full() {
+					self.store.note_map_full("clear_pending_chain_operation");
+				}
 				self.requires_init_recovery.store(true, Ordering::SeqCst);
-				Err(e.into())
+				Err(err)
 			}
 		}
 	}
@@ -848,6 +958,27 @@ impl Chain {
 	}
 
 	fn recover_pending_chain_operation_checked(&self, recovery_context: &str) -> Result<(), Error> {
+		if self.store.writes_frozen() {
+			self.store.note_map_full(recovery_context);
+			self.requires_init_recovery.store(true, Ordering::SeqCst);
+			return Err(Error::Other(
+				"LMDB map is full; restart the node to grow the map".into(),
+			));
+		}
+		if self
+			.recovery_in_progress
+			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+			.is_err()
+		{
+			return Ok(());
+		}
+		struct RecoveryInProgressGuard(Arc<AtomicBool>);
+		impl Drop for RecoveryInProgressGuard {
+			fn drop(&mut self) {
+				self.0.store(false, Ordering::SeqCst);
+			}
+		}
+		let _recovery_guard = RecoveryInProgressGuard(self.recovery_in_progress.clone());
 		warn!("attempting recovery: {}", recovery_context);
 		let secp = Secp256k1::with_caps(ContextFlag::Commit)?;
 		let mut header_pmmr = self.header_pmmr.write();
@@ -874,6 +1005,7 @@ impl Chain {
 			&secp,
 			self.pow_verifier,
 			self.stop_state.clone(),
+			self.archive_mode,
 		) {
 			Ok(()) => {
 				self.requires_init_recovery.store(false, Ordering::SeqCst);
@@ -895,6 +1027,12 @@ impl Chain {
 		e: &Error,
 		marker_guard: &mut PendingChainOperationGuard,
 	) {
+		if e.is_lmdb_map_full() {
+			self.store.note_map_full(op_name);
+			// Keep recovery required until the environment is safely reopened.
+			marker_guard.require_recovery();
+			return;
+		}
 		warn!(
 			"{} failed after marker was set; will attempt recovery: {}",
 			op_name, e
@@ -1145,15 +1283,28 @@ impl Chain {
 		// occurrence format before recovery can rewind blocks that carry them.
 		// The output PMMR is open at this point, so the migration resolves each
 		// active-window legacy position's commitment from retained leaf data.
-		Chain::migrate_spent_index(&store, &txhashset, stop_state.clone())?;
+		match Chain::migrate_spent_index(&store, &txhashset, stop_state.clone()) {
+			Ok(()) => {}
+			Err(e) if skip_start_blockchain_validation => {
+				warn!(
+					"migrate_spent_index failed during start (skip validation): {}; continuing",
+					e
+				);
+			}
+			Err(e) => return Err(e),
+		}
 
 		// The spent-occurrence index must be complete before recovery runs:
 		// rewind and reconciliation paths consume it. An index left incomplete
 		// by a crash or an older version is rebuilt from the retained full
 		// blocks here.
-		Chain::init_spent_commitment_index(&store, stop_state.clone())?;
+		Chain::init_spent_commitment_index(
+			&store,
+			stop_state.clone(),
+			skip_start_blockchain_validation,
+		)?;
 
-		mark_interrupted_pibd_for_recovery(&genesis, &store, &txhashset)?;
+		mark_interrupted_pibd_for_recovery(&genesis, &store, &txhashset, archive_mode)?;
 
 		recover_pending_chain_operation(
 			&genesis,
@@ -1163,6 +1314,7 @@ impl Chain {
 			secp,
 			pow_verifier,
 			stop_state.clone(),
+			archive_mode,
 		)?;
 
 		setup_head(
@@ -1180,32 +1332,59 @@ impl Chain {
 		// Initialize the output_pos index based on UTXO set
 		// and NRD kernel_pos index based recent kernel history.
 		let kernel_pos_index_complete = {
-			let batch = store.batch_write()?;
-			if batch.is_output_pos_index_complete()? {
-				debug!("init: output_pos index is complete, skipping rebuild");
-			} else {
-				txhashset.init_output_pos_index(&batch, sync_state.clone(), stop_state.clone())?;
+			let rebuild = || -> Result<bool, Error> {
+				let batch = store.batch_write()?;
+				if batch.is_output_pos_index_complete()? {
+					debug!("init: output_pos index is complete, skipping rebuild");
+				} else {
+					txhashset.init_output_pos_index(
+						&batch,
+						sync_state.clone(),
+						stop_state.clone(),
+					)?;
+				}
+				txhashset.init_recent_kernel_pos_index(
+					&batch,
+					sync_state.clone(),
+					stop_state.clone(),
+				)?;
+				let complete = batch.is_kernel_pos_index_complete()?;
+				batch.commit()?;
+				Ok(complete)
+			};
+			match rebuild() {
+				Ok(complete) => complete,
+				Err(e) if skip_start_blockchain_validation => {
+					warn!(
+						"init: output/kernel pos index rebuild failed: {}; continuing",
+						e
+					);
+					true
+				}
+				Err(e) => return Err(e),
 			}
-			txhashset.init_recent_kernel_pos_index(
-				&batch,
-				sync_state.clone(),
-				stop_state.clone(),
-			)?;
-			let complete = batch.is_kernel_pos_index_complete()?;
-			batch.commit()?;
-			complete
 		};
 		if !kernel_pos_index_complete {
-			txhashset.init_kernel_pos_index_chunked(
+			if let Err(e) = txhashset.init_kernel_pos_index_chunked(
 				&store,
 				sync_state.clone(),
 				stop_state.clone(),
-			)?;
+			) {
+				if skip_start_blockchain_validation {
+					warn!("init: kernel_pos chunked rebuild failed: {}; continuing", e);
+				} else {
+					return Err(e);
+				}
+			}
 		}
 		// Re-check after recovery and head setup: on a fresh DB the head did not
 		// exist at the first call, and recovery may have reset chain state.
 		// No-op if the index is already complete.
-		Chain::init_spent_commitment_index(&store, stop_state.clone())?;
+		Chain::init_spent_commitment_index(
+			&store,
+			stop_state.clone(),
+			skip_start_blockchain_validation,
+		)?;
 
 		let chain = Chain {
 			db_root,
@@ -1222,6 +1401,7 @@ impl Chain {
 			pibd_params,
 			stop_state,
 			requires_init_recovery: Arc::new(AtomicBool::new(false)),
+			recovery_in_progress: Arc::new(AtomicBool::new(false)),
 			pibd_state_generation: Arc::new(AtomicU64::new(0)),
 			#[cfg(test)]
 			fail_next_process_block_marker_clear: AtomicBool::new(false),
@@ -1295,6 +1475,151 @@ impl Chain {
 				Err(e)
 			}
 		}
+	}
+
+	/// Read the user's optional fixed checkpoint (not a consensus checkpoint).
+	pub fn local_checkpoint(&self) -> Result<Option<Tip>, Error> {
+		Ok(self.store.local_checkpoint()?)
+	}
+
+	/// Local policy conflict observed since startup; does not imply peer misconduct.
+	pub fn local_checkpoint_conflict(&self) -> bool {
+		self.store.local_checkpoint_conflict()
+	}
+
+	/// Positive trailing depth for rolling policy; None for fixed/off.
+	pub fn rolling_checkpoint_depth(&self) -> Result<Option<u64>, Error> {
+		Ok(self.store.rolling_checkpoint_depth()?)
+	}
+
+	/// Preview an exact, body-validated checkpoint a specified number of blocks back.
+	pub fn preview_local_checkpoint(&self, depth: u64) -> Result<Tip, Error> {
+		self.ensure_chain_robust()?;
+		let _headers = self.header_pmmr.read();
+		let _bodies = self.txhashset.read();
+		let batch = self.store.batch_read()?;
+		let head = batch.head()?;
+		if depth == 0 || depth >= head.height || head != batch.header_head()? {
+			return Err(Error::Other("Checkpoint requires a caught-up node and a positive depth smaller than its body height".into()));
+		}
+		let header = self.checkpoint_ancestor(&batch, head.height - depth)?;
+		Ok(Tip::try_from_header(&header)?)
+	}
+
+	fn checkpoint_ancestor(&self, batch: &store::Batch<'_>, height: u64) -> Result<BlockHeader, Error> {
+		if self.requires_init_recovery.load(Ordering::SeqCst)
+			|| batch.get_chain_marker::<PendingChainOperation>(store::ChainMarker::LastChainOperation)?.is_some() {
+			return Err(Error::ChainRestartRequired);
+		}
+		let (mut current, _) = canonical_tip_header("select local checkpoint", &batch.head()?, batch)?;
+		if height == 0 || height >= current.height {
+			return Err(Error::Other("Checkpoint must be below the validated body tip and above genesis".into()));
+		}
+		let mut visited = HashSet::new();
+		while current.height > height {
+			current = crate::checked_previous_header(self.get_context_id(), &current, &mut visited,
+				"select local checkpoint", |h| batch.get_block_header(h))?;
+		}
+		Ok(current)
+	}
+
+	/// Pin the exact previewed height/hash, under the normal chain writer locks.
+	/// A tip advance is fine; a changed ancestor requires a new user confirmation.
+	pub fn set_local_checkpoint(&self, height: u64, expected_hash: &str) -> Result<Tip, Error> {
+		self.configure_local_checkpoint(height, expected_hash, None)
+	}
+
+	/// Enable fixed or rolling policy only after confirmation of an exact anchor.
+	pub fn configure_local_checkpoint(&self, height: u64, expected_hash: &str, depth: Option<u64>) -> Result<Tip, Error> {
+		self.ensure_chain_robust()?;
+		let _headers = self.header_pmmr.write();
+		let _bodies = self.txhashset.write();
+		let batch = self.store.batch_write()?;
+		if batch.local_checkpoint()?.is_some() {
+			return Err(Error::Other("Remove the existing checkpoint explicitly before selecting another".into()));
+		}
+		if batch.head()? != batch.header_head()? {
+			return Err(Error::Other("Wait for the node to catch up before pinning a checkpoint".into()));
+		}
+		if let Some(depth) = depth {
+			if depth == 0 || depth >= batch.head()?.height || height > batch.head()?.height - depth {
+				return Err(Error::Other("Rolling checkpoint requires a positive depth and a sufficiently deep confirmed anchor".into()));
+			}
+		}
+		let header = self.checkpoint_ancestor(&batch, height)?;
+		let pin = Tip::try_from_header(&header)?;
+		if pin.last_block_h.to_hex() != expected_hash {
+			return Err(Error::Other("Checkpoint preview changed; review and confirm the new block".into()));
+		}
+		let _update = self.store.checkpoint_update_lock();
+		batch.set_local_checkpoint(Some(&pin))?;
+		batch.set_rolling_checkpoint_depth(depth)?;
+		// Consumers created under the old policy must reselect their snapshot.
+		self.advance_pibd_state_generation()?;
+		batch.commit()?;
+		self.store.clear_checkpoint_conflict()?;
+		Ok(pin)
+	}
+
+	/// Called by native sync maintenance only when peers report sync complete.
+	/// An offline/catching-up caller must pass false. Recheck authoritative heads
+	/// under chain writer locks; never select a header-only or backward checkpoint.
+	pub fn advance_rolling_checkpoint(&self, caught_up: bool) -> Result<Option<Tip>, Error> {
+		if !caught_up || self.store.local_checkpoint_conflict() || self.store.rolling_checkpoint_depth()?.is_none() {
+			return Ok(None);
+		}
+		self.ensure_chain_robust()?;
+		let _headers = self.header_pmmr.write();
+		let _bodies = self.txhashset.write();
+		// Avoid a writer transaction on every sync tick when the tip hasn't moved.
+		{
+			let batch = self.store.batch_read()?;
+			let Some(depth) = batch.rolling_checkpoint_depth()? else { return Ok(None); };
+			let Some(pin) = batch.local_checkpoint()? else { return Err(Error::Other("Local checkpoint anchor missing".into())); };
+			let head = batch.head()?;
+			if head != batch.header_head()? || head.height.saturating_sub(depth) <= pin.height { return Ok(None); }
+		}
+		let batch = self.store.batch_write()?;
+		let Some(depth) = batch.rolling_checkpoint_depth()? else { return Ok(None); };
+		if depth == 0 { return Err(Error::Other("Local checkpoint rolling depth is invalid".into())); }
+		let Some(old) = batch.local_checkpoint()? else { return Err(Error::Other("Local checkpoint anchor missing".into())); };
+		let head = batch.head()?;
+		let target = head.height.saturating_sub(depth);
+		if head != batch.header_head()? || target <= old.height { return Ok(None); }
+		let header = self.checkpoint_ancestor(&batch, target)?;
+		// Must still descend from the previous anchor, even after an offline gap.
+		batch.validate_checkpoint_header(&header)?;
+		let pin = Tip::try_from_header(&header)?;
+		let _update = self.store.checkpoint_update_lock();
+		if self.store.local_checkpoint_conflict() { return Ok(None); }
+		batch.set_local_checkpoint(Some(&pin))?;
+		self.advance_pibd_state_generation()?;
+		batch.commit()?;
+		Ok(Some(pin))
+	}
+
+	/// Stop automatic advancement without weakening the current anchor.
+	pub fn freeze_local_checkpoint(&self) -> Result<Option<Tip>, Error> {
+		let _headers = self.header_pmmr.write();
+		let _bodies = self.txhashset.write();
+		let batch = self.store.batch_write()?;
+		let pin = batch.local_checkpoint()?;
+		batch.set_rolling_checkpoint_depth(None)?;
+		batch.commit()?;
+		Ok(pin)
+	}
+
+	/// Explicitly remove local policy without deleting or rewinding chain data.
+	pub fn clear_local_checkpoint(&self) -> Result<(), Error> {
+		let _headers = self.header_pmmr.write();
+		let _bodies = self.txhashset.write();
+		let batch = self.store.batch_write()?;
+		let _update = self.store.checkpoint_update_lock();
+		batch.set_local_checkpoint(None)?;
+		batch.set_rolling_checkpoint_depth(None)?;
+		batch.commit()?;
+		self.store.clear_checkpoint_conflict()?;
+		Ok(())
 	}
 
 	/// Reset both head and header_head to the provided header.
@@ -1880,13 +2205,8 @@ impl Chain {
 							for b in &blocks {
 								block_hashes.push((b.header.height, b.hash(context_id)?));
 							}
-							match self.process_block_multiple(secp, &blocks, opts) {
+							match self.process_block_multiple_inner(secp, &blocks, opts, true) {
 								Ok(tip) => {
-									info!(
-										"Accepted multiple blocks from {} to {}",
-										blocks.first().map(|b| b.header.height).unwrap_or(0),
-										blocks.last().map(|b| b.header.height).unwrap_or(0)
-									);
 									// We are good, let's clean up the orphans
 									for (height, hash) in block_hashes {
 										let _ = self
@@ -2162,6 +2482,9 @@ impl Chain {
 		opts: Options,
 		source_peers: HashSet<String>,
 	) -> Result<(), Error> {
+		if self.stage_known_header_orphan(b, opts, &source_peers)? {
+			return Err(Error::Orphan(String::new()));
+		}
 		// Process the header first.
 		// If invalid then fail early.
 		// If valid then continue with block processing with header_head committed to db etc.
@@ -2180,6 +2503,57 @@ impl Chain {
 		Ok(())
 	}
 
+	/// Queue, never accept, an already header-admitted future body while a writer
+	/// owns the header lock. This lets the existing bounded live batch consume
+	/// arrivals on its next pass instead of serializing admission behind fsync.
+	/// A stale snapshot can only enqueue an orphan: canonical selection and full
+	/// header/body/state validation remain authoritative before durable acceptance.
+	fn stage_known_header_orphan(
+		&self,
+		b: &Block,
+		opts: Options,
+		source_peers: &HashSet<String>,
+	) -> Result<bool, Error> {
+		if !(cfg!(target_os = "ios") || cfg!(test))
+			|| option_env!("MWC_STAGE_SYNC_ORPHANS") == Some("0")
+			|| !opts.contains(Options::SYNC)
+			|| self.is_stop_requested()
+			|| self.requires_init_recovery.load(Ordering::SeqCst)
+			|| self.recovery_in_progress.load(Ordering::SeqCst)
+			|| self.header_pmmr.try_read().is_some()
+		{
+			return Ok(false);
+		}
+		let context_id = self.get_context_id();
+		pipe::validate_header_context_id(context_id, &b.header)?;
+		let hash = b.hash(context_id)?;
+		pipe::validate_header_hash(context_id, &hash)?;
+		let batch = self.store.batch_read()?;
+		let head = batch.head()?;
+		let header_head = batch.header_head()?;
+		#[cfg(test)]
+		let depth = self.process_block_batch_safety_depth.load(Ordering::SeqCst);
+		#[cfg(not(test))]
+		let depth = 100;
+		if b.header.height <= head.height.saturating_add(1)
+			|| b.header.height >= header_head.height.saturating_sub(depth)
+			|| b.header.prev_hash == head.last_block_h
+			|| batch.block_exists(&hash)?
+			|| batch.block_exists(&b.header.prev_hash)?
+			|| !pipe::is_exact_known_header(context_id, &b.header, &header_head, &batch)?
+		{
+			return Ok(false);
+		}
+		drop(batch);
+		self.orphans.add(context_id, Orphan {
+			block: b.clone(),
+			opts,
+			source_peers: source_peers.clone(),
+			added: Instant::now(),
+		})?;
+		Ok(true)
+	}
+
 	/// Attempt to add a new block to the chain.
 	/// Returns true if it has been added to the longest chain
 	/// or false if it has added to a fork (or orphan?).
@@ -2189,6 +2563,7 @@ impl Chain {
 		b: Block,
 		opts: Options,
 	) -> Result<Option<Tip>, BlockProcessingError> {
+		let _sync_log = crate::types::SyncApplyLogGuard::enter(opts);
 		let mut state_may_have_changed = false;
 		let completion = {
 			let mut header_pmmr = self.header_pmmr.write();
@@ -2273,6 +2648,48 @@ impl Chain {
 		blocks: &Vec<Block>,
 		opts: Options,
 	) -> Result<Option<Tip>, BlockProcessingError> {
+		self.process_block_multiple_inner(secp, blocks, opts, false)
+	}
+
+	/// Expand only the live network batch, after acquiring the state writer.
+	/// Replay deliberately keeps its existing commit-unit and recovery policy.
+	fn process_block_multiple_inner(
+		&self,
+		secp: &mut Secp256k1,
+		blocks: &Vec<Block>,
+		opts: Options,
+		live: bool,
+	) -> Result<Option<Tip>, BlockProcessingError> {
+		let _sync_log = crate::types::SyncApplyLogGuard::enter(opts);
+		let result = (|| {
+		struct Sample {
+			phase: usize,
+			initial: usize,
+			added: usize,
+			committed: bool,
+			live: bool,
+		}
+		impl Drop for Sample {
+			fn drop(&mut self) {
+				if self.live {
+					mwc_util::sync_diagnostics::record_batch_reason(self.phase);
+					mwc_util::sync_diagnostics::record_live_batch(
+						self.initial,
+						self.added,
+						self.committed,
+					);
+				}
+			}
+		}
+		let mut sample = Sample {
+			phase: 8,
+			initial: blocks.len(),
+			added: 0,
+			committed: false,
+			live,
+		};
+		let mut expanded = None;
+		let mut added_hashes = Vec::new();
 		let first_height = blocks
 			.first()
 			.ok_or_else(|| {
@@ -2280,14 +2697,44 @@ impl Chain {
 			})?
 			.header
 			.height;
-		let last_block = blocks.last().ok_or_else(|| {
-			Error::Other("Internal error, empty blocks at process_block_multiple".into())
-		})?;
-		let last_height = last_block.header.height;
 		let mut state_may_have_changed = false;
 		let completion = {
+			let wait_started = Instant::now();
 			let mut header_pmmr = self.header_pmmr.write();
 			let mut txhashset = self.txhashset.write();
+			if live {
+				mwc_util::sync_diagnostics::Metric::LiveBatchWait
+					.record(wait_started.elapsed(), true);
+			}
+			let mut hold_timing = if live {
+				Some(mwc_util::sync_diagnostics::Metric::LiveBatchHold.start())
+			} else {
+				None
+			};
+			// Compile-time A/B switch: no environment lookup on the hot path.
+			if live
+				&& option_env!("MWC_LATE_BATCHING") != Some("0")
+				&& opts.contains(Options::SYNC)
+				&& !self.is_stop_requested()
+			{
+				let additions = self.collect_late_batch(&header_pmmr, blocks)?;
+				if !additions.is_empty() {
+					let mut all = blocks.clone();
+					for b in additions {
+						added_hashes.push((
+							b.header.height,
+							b.hash(self.get_context_id()).map_err(Error::from)?,
+						));
+						all.push(b);
+					}
+					sample.added = added_hashes.len();
+					expanded = Some(all);
+				}
+			}
+			let blocks = expanded.as_ref().unwrap_or(blocks);
+			let last_block = blocks
+				.last()
+				.ok_or_else(|| Error::Other("empty block batch".into()))?;
 			let op =
 				prepare_reconcile_heads_operation(&self.store, ChainOperationKind::ProcessBlock)?;
 			let marker_guard = self.set_pending_chain_operation_checked(&op)?;
@@ -2296,6 +2743,7 @@ impl Chain {
 				let prev_head = batch.head()?;
 				let mut ctx = self.new_ctx(opts, batch, &mut header_pmmr, &mut txhashset)?;
 
+				sample.phase = 9;
 				let (head, fork_point) = pipe::process_blocks_series(
 					self.store.get_context_id(),
 					&blocks,
@@ -2318,16 +2766,25 @@ impl Chain {
 					prev_head,
 					Tip::try_from_header(&fork_point)?,
 				);
+				sample.phase = 10;
 				ctx.batch.commit()?;
+				sample.committed = true;
+				sample.phase = 11;
 
 				Ok((head, status))
 			})();
-			self.finish_pending_chain_operation(
+			let completion = self.finish_pending_chain_operation(
 				"process_block_multiple",
 				res,
 				state_may_have_changed,
 				marker_guard,
-			)
+			);
+			if completion.is_ok() {
+				if let Some(timer) = &mut hold_timing {
+					timer.success();
+				}
+			}
+			completion
 		}?;
 
 		let (head, status) = match completion {
@@ -2348,6 +2805,15 @@ impl Chain {
 			}
 		};
 
+		sample.phase = 12;
+		let blocks = expanded.as_ref().unwrap_or(blocks);
+		let last_height = blocks
+			.last()
+			.map(|b| b.header.height)
+			.unwrap_or(first_height);
+		if live {
+			log_accepted_multiple_blocks(opts, first_height, last_height);
+		}
 		debug!(
 			"Accepted multiple {} block from height {} to {}",
 			blocks.len(),
@@ -2371,8 +2837,94 @@ impl Chain {
 		for b in blocks {
 			self.adapter.block_accepted(secp, b, status, opts);
 		}
+		// Only release late orphan entries after durable success and recovery.
+		// Failure leaves them available to the existing single-block fallback,
+		// which attributes bad child data to the child's own source peers.
+		for (height, hash) in added_hashes {
+			let _ = self.orphans.remove_by_height_header_hash(height, &hash);
+		}
 
 		Ok(head)
+		})();
+		if live {
+			if let Err(ref failure) = result {
+				let e = match failure {
+					BlockProcessingError::NotCommitted(e) | BlockProcessingError::CommittedRecoveryFailed(e) => e,
+				};
+				let reason = if e.is_known_block() { 13 }
+					else if matches!(e, Error::Orphan(_)) || e.is_not_found() { 14 }
+					else if e.is_bad_data() { 15 }
+					else { 16 };
+				mwc_util::sync_diagnostics::record_batch_reason(reason);
+			}
+		}
+		result
+	}
+
+	fn collect_late_batch(
+		&self,
+		header_pmmr: &PMMRHandle<BlockHeader>,
+		blocks: &[Block],
+	) -> Result<Vec<Block>, Error> {
+		const MAX_LIVE_BATCH: usize = 8;
+		let mut additions = Vec::new();
+		if blocks.len() >= MAX_LIVE_BATCH {
+			mwc_util::sync_diagnostics::record_batch_reason(0);
+			return Ok(additions);
+		}
+		let Some(last) = blocks.last() else {
+			mwc_util::sync_diagnostics::record_batch_reason(1);
+			return Ok(additions);
+		};
+		let context_id = self.get_context_id();
+		let batch = self.store.batch_read()?;
+		let header_head = batch.header_head()?;
+		#[cfg(test)]
+		let depth = self.process_block_batch_safety_depth.load(Ordering::SeqCst);
+		#[cfg(not(test))]
+		let depth = 100;
+		let limit = header_head.height.saturating_sub(depth);
+		let mut height = last.header.height;
+		let mut previous = last.hash(context_id)?;
+		// Authenticate the original tail on the CURRENT header branch before
+		// extending it. The normal pipeline remains authoritative for its body.
+		if height >= limit || header_pmmr.get_header_hash_by_height(height)? != previous {
+			mwc_util::sync_diagnostics::record_batch_reason(2);
+			return Ok(additions);
+		}
+		while blocks.len() + additions.len() < MAX_LIVE_BATCH {
+			let Some(next) = height.checked_add(1) else {
+				mwc_util::sync_diagnostics::record_batch_reason(3);
+				break;
+			};
+			if next >= limit {
+				mwc_util::sync_diagnostics::record_batch_reason(4);
+				break;
+			}
+			let header = load_header_at_height(context_id, header_pmmr, &batch, next)?;
+			if header.prev_hash != previous {
+				mwc_util::sync_diagnostics::record_batch_reason(5);
+				break;
+			}
+			let hash = header.hash(context_id)?;
+			let Some(orphan) = self.orphans.get_orphan(&hash) else {
+				mwc_util::sync_diagnostics::record_batch_reason(6);
+				break;
+			};
+			// An orphan is only header-admitted, not body-validated. Never infer
+			// body validity from its hash: process_blocks_series checks every body.
+			if orphan.block.header != header {
+				mwc_util::sync_diagnostics::record_batch_reason(7);
+				break;
+			}
+			additions.push(orphan.block);
+			height = next;
+			previous = hash;
+		}
+		if blocks.len() + additions.len() >= MAX_LIVE_BATCH {
+			mwc_util::sync_diagnostics::record_batch_reason(0);
+		}
+		Ok(additions)
 	}
 
 	/// Process a block header received during "header first" propagation.
@@ -2394,7 +2946,9 @@ impl Chain {
 		let is_known = self.with_robust_header_pmmr_read(|_| {
 			let batch = self.store.batch_read()?;
 			let header_head = batch.header_head()?;
-			pipe::is_exact_known_header(context_id, bh, &header_head, &batch)
+			let known = pipe::is_exact_known_header(context_id, bh, &header_head, &batch)?;
+			if known { batch.validate_checkpoint_header(bh)?; }
+			Ok(known)
 		})?;
 		if is_known {
 			return Ok(());
@@ -2455,6 +3009,12 @@ impl Chain {
 		opts: Options,
 	) -> Result<Option<Tip>, Error> {
 		self.ensure_chain_robust()?;
+		if self.store.writes_frozen() {
+			self.store.note_map_full("sync_block_headers");
+			return Err(Error::Other(
+				"LMDB map is full; restart the node to grow the map".into(),
+			));
+		}
 		let context_id = self.store.get_context_id();
 		for header in headers {
 			pipe::validate_header_context_id(context_id, header)?;
@@ -4382,6 +4942,323 @@ impl Chain {
 			.map_err(|e| Error::StoreErr(e, "chain head".to_owned()))
 	}
 
+	/// Keep BODY_HEAD aligned with the applied PMMR tip.
+	///
+	/// Stored full blocks beyond the PMMR tip are never adopted as HEAD. They
+	/// are replayed through the normal apply path so PMMR can catch up without
+	/// the network.
+	pub fn resume_body_head_from_stored_blocks(&self) -> Result<Option<Tip>, Error> {
+		let mut timing = mwc_util::sync_diagnostics::Metric::BodyReconcile.start();
+		self.ensure_chain_robust()?;
+		if !self.archive_mode {
+			timing.success();
+			return Ok(None);
+		}
+		let lock_started = Instant::now();
+		let mut header_pmmr = self.header_pmmr.write();
+		let mut txhashset = self.txhashset.write();
+		mwc_util::sync_diagnostics::Metric::BodyReconcileWait.record(lock_started.elapsed(), true);
+		let stored_head = self
+			.store
+			.head()
+			.map_err(|e| Error::StoreErr(e, "resume body head load HEAD".to_owned()))?;
+		let mut batch = self.store.batch_write()?;
+		let reconciled = reconcile_body_head_with_pmmr(
+			self.store.get_context_id(),
+			&mut header_pmmr,
+			&mut txhashset,
+			&mut batch,
+			&stored_head,
+		)?;
+		if reconciled.is_some() {
+			batch.commit()?;
+		}
+		timing.success();
+		Ok(reconciled)
+	}
+
+	/// True when the next height after HEAD has a stored full body.
+	/// Body-sync uses this to keep GetBlock off the network until contiguous
+	/// stored-body replay has caught the local stored tip.
+	pub fn has_stored_body_after_head(&self) -> Result<bool, Error> {
+		self.ensure_chain_robust()?;
+		let head = self.head()?;
+		let next_height = match head.height.checked_add(1) {
+			Some(height) => height,
+			None => return Ok(false),
+		};
+		let header = match self.get_header_by_height(next_height) {
+			Ok(header) => header,
+			Err(e) if e.is_not_found() => return Ok(false),
+			// InvalidHeaderHeight means the header MMR has no leaf at this
+			// height — same meaning here as "no header beyond head."
+			Err(Error::InvalidHeaderHeight(_)) => return Ok(false),
+			Err(e) => return Err(e),
+		};
+		match self.get_block_for_header(&header) {
+			Ok(_) => Ok(true),
+			Err(e) if e.is_not_found() => Ok(false),
+			Err(e) => Err(e),
+		}
+	}
+
+	/// True when the registered stop state has been requested.
+	pub fn is_stop_requested(&self) -> bool {
+		self.stop_state
+			.as_ref()
+			.map(|s| s.is_stopped())
+			.unwrap_or(false)
+	}
+
+	fn log_stored_body_replay_aborted(&self, at_height: u64) {
+		let head_height = self.head().map(|h| h.height).unwrap_or(0);
+		warn!(
+			"stored-body replay aborted by shutdown at height {}, HEAD remains {}",
+			at_height, head_height
+		);
+	}
+
+	/// Replay a bounded prefix of stored full bodies so PMMR can catch up to
+	/// the last contiguous stored body. HEAD stays on the last applied body.
+	///
+	/// Loads up to `max_blocks` stored bodies from HEAD+1 and applies them in
+	/// `process_block_multiple` chunks of at most 8 (1 after leftover-prune
+	/// recovery is observed). `process_block_multiple` commits one store batch
+	/// for the whole chunk, so a shutdown mid-apply rolls the chunk back and
+	/// HEAD stays on the last committed height. On a batch error, falls back to
+	/// smaller batches or single-block apply rather than aborting replay.
+	/// Headers are already on disk; `process_blocks_series` calls
+	/// `process_block_header` for each block.
+	///
+	/// If stop is requested after bodies were collected, the in-flight chunk is
+	/// still applied rather than dropped. A new chunk is not started.
+	///
+	/// Logs `replaying stored body height N` every 1000 heights.
+	pub fn replay_stored_bodies(
+		&self,
+		secp: &mut Secp256k1,
+		max_blocks: u64,
+	) -> Result<u64, Error> {
+		self.replay_stored_bodies_inner(secp, max_blocks, true)
+	}
+
+	/// Replay after the caller has successfully called
+	/// `resume_body_head_from_stored_blocks` in this iteration. BodySync keeps
+	/// that call outside its retryable replay error handling. Skipping only the
+	/// redundant reconciliation preserves the recovery checks and fully validated
+	/// block application below; it does not skip validation or durable commits.
+	pub fn replay_stored_bodies_after_reconcile(
+		&self,
+		secp: &mut Secp256k1,
+		max_blocks: u64,
+	) -> Result<u64, Error> {
+		self.replay_stored_bodies_inner(secp, max_blocks, false)
+	}
+
+	fn replay_stored_bodies_inner(
+		&self,
+		secp: &mut Secp256k1,
+		max_blocks: u64,
+		reconcile: bool,
+	) -> Result<u64, Error> {
+		self.ensure_chain_robust()?;
+		if max_blocks == 0 {
+			return Ok(0);
+		}
+		if self.is_stop_requested() {
+			let at = self.head()?.height.saturating_add(1);
+			self.log_stored_body_replay_aborted(at);
+			return Ok(0);
+		}
+		if reconcile {
+			self.resume_body_head_from_stored_blocks()?;
+		}
+		let mut applied = 0u64;
+		while applied < max_blocks {
+			if self.is_stop_requested() {
+				let at = self.head()?.height.saturating_add(1);
+				self.log_stored_body_replay_aborted(at);
+				break;
+			}
+			let mut blocks: Vec<Block> = Vec::new();
+			let head = self.head()?;
+			let mut next_height = match head.height.checked_add(1) {
+				Some(height) => height,
+				None => break,
+			};
+			let remaining = max_blocks.saturating_sub(applied);
+			let commit_cap = (stored_body_commit_batch() as u64).min(remaining);
+			while (blocks.len() as u64) < commit_cap {
+				if self.is_stop_requested() {
+					// Keep already-collected bodies so the in-flight chunk can commit.
+					break;
+				}
+				let header = match self.get_header_by_height(next_height) {
+					Ok(header) => header,
+					Err(e) if e.is_not_found() => break,
+					// Header MMR has no leaf at this height — nothing more to replay.
+					Err(Error::InvalidHeaderHeight(_)) => break,
+					Err(e) => return Err(e),
+				};
+				let block = match self.get_block_for_header(&header) {
+					Ok(block) => block,
+					Err(e) if e.is_not_found() => break,
+					Err(e) => return Err(e),
+				};
+				if blocks.is_empty() && applied == 0 && next_height > 1 {
+					static LAST_HEIGHT: AtomicU64 = AtomicU64::new(0);
+					static LAST_SECS: AtomicU64 = AtomicU64::new(0);
+					if take_info_rate_limit(&LAST_HEIGHT, &LAST_SECS, next_height, 1000, 10) {
+						info!(
+							"PMMR behind stored bodies: replaying from height {}",
+							next_height
+						);
+					}
+				}
+				if next_height == 1 || next_height % 1000 == 0 {
+					info!("replaying stored body height {}", next_height);
+				}
+				blocks.push(block);
+				next_height = match next_height.checked_add(1) {
+					Some(height) => height,
+					None => break,
+				};
+			}
+			if blocks.is_empty() {
+				if self.is_stop_requested() {
+					self.log_stored_body_replay_aborted(next_height);
+				}
+				break;
+			}
+			let in_flight_height = blocks[0].header.height;
+			let stopping = self.is_stop_requested();
+			let n = self.apply_stored_body_batch(secp, blocks)?;
+			if n == 0 {
+				// Known-block / concurrent apply made no local progress.
+				// Caller continues if a stored body still follows HEAD.
+				break;
+			}
+			applied = applied.saturating_add(n);
+			if stopping || self.is_stop_requested() {
+				self.log_stored_body_replay_aborted(in_flight_height);
+				break;
+			}
+		}
+		Ok(applied)
+	}
+
+	/// Apply a contiguous stored-body series with process_block_multiple,
+	/// falling back to smaller batches or process_block_single on error.
+	/// Each process_block_multiple call is capped at 8 blocks (1 after leftover
+	/// recovery) so a shutdown mid-apply cannot roll back a 128-block batch.
+	/// If stop is already set, still apply one in-flight chunk rather than drop it.
+	fn apply_stored_body_batch(
+		&self,
+		secp: &mut Secp256k1,
+		mut blocks: Vec<Block>,
+	) -> Result<u64, Error> {
+		let mut applied = 0u64;
+		while !blocks.is_empty() {
+			let stopping = self.is_stop_requested();
+			if stopping && applied > 0 {
+				break;
+			}
+			let head_height = self.head()?.height;
+			blocks.retain(|b| b.header.height > head_height);
+			if blocks.is_empty() {
+				break;
+			}
+			let cap = if stopping {
+				1
+			} else {
+				stored_body_commit_batch()
+			};
+			let take = cap.min(blocks.len());
+			let chunk: Vec<Block> = blocks.drain(..take).collect();
+			applied = applied.saturating_add(self.apply_stored_body_chunk(secp, chunk)?);
+			if stopping {
+				break;
+			}
+		}
+		Ok(applied)
+	}
+
+	fn apply_stored_body_chunk(
+		&self,
+		secp: &mut Secp256k1,
+		mut blocks: Vec<Block>,
+	) -> Result<u64, Error> {
+		let mut applied = 0u64;
+		while !blocks.is_empty() {
+			let head_height = self.head()?.height;
+			blocks.retain(|b| b.header.height > head_height);
+			if blocks.is_empty() {
+				break;
+			}
+			let batch_len = blocks.len();
+			if batch_len == 1 {
+				let block = blocks
+					.pop()
+					.ok_or_else(|| Error::Other("stored body batch empty".into()))?;
+				match self.process_block(secp, block, Options::SYNC, HashSet::new()) {
+					Ok(_) => {
+						applied = applied.saturating_add(1);
+					}
+					Err(e) if e.is_known_block() => {}
+					Err(e) => return Err(e),
+				}
+				continue;
+			}
+			match self.process_block_multiple(secp, &blocks, Options::SYNC) {
+				Ok(_) => {
+					log_accepted_multiple_blocks(
+						Options::SYNC,
+						blocks.first().map(|b| b.header.height).unwrap_or(0),
+						blocks.last().map(|b| b.header.height).unwrap_or(0),
+					);
+					applied = applied.saturating_add(batch_len as u64);
+					break;
+				}
+				Err(BlockProcessingError::NotCommitted(e)) => {
+					let new_head = self.head()?.height;
+					let before = blocks.len();
+					blocks.retain(|b| b.header.height > new_head);
+					if blocks.len() < before {
+						// Another thread applied a prefix. Retry the remainder.
+						if e.is_known_block() {
+							continue;
+						}
+					}
+					if e.is_bad_data() {
+						info!(
+							"Failed to process multiple stored bodies, will try smaller batches. {}",
+							e
+						);
+					} else {
+						debug!(
+							"Failed to process multiple stored bodies, will try smaller batches. {}",
+							e
+						);
+					}
+					if blocks.len() <= 1 {
+						continue;
+					}
+					let mid = blocks.len() / 2;
+					let rest = blocks.split_off(mid);
+					applied = applied.saturating_add(self.apply_stored_body_chunk(secp, blocks)?);
+					blocks = rest;
+				}
+				Err(BlockProcessingError::CommittedRecoveryFailed(e)) => {
+					return Err(Error::committed_recovery_failed(
+						"replay_stored_bodies process_block_multiple committed marker cleanup",
+						e,
+					));
+				}
+			}
+		}
+		Ok(applied)
+	}
+
 	/// Tail of the block chain in this node after compact (cross-block cut-through)
 	pub fn tail(&self) -> Result<Tip, Error> {
 		self.ensure_chain_robust()?;
@@ -4640,6 +5517,7 @@ impl Chain {
 	pub(crate) fn init_spent_commitment_index(
 		store: &ChainStore,
 		stop_state: Option<Arc<StopState>>,
+		skip_start_blockchain_validation: bool,
 	) -> Result<(), Error> {
 		let batch = store
 			.batch_read()
@@ -4658,6 +5536,18 @@ impl Chain {
 
 		if complete {
 			return Ok(());
+		}
+
+		// Mobile / partial-archive startup passes skip_start_blockchain_validation.
+		// BODY_HEAD can sit on header-only heights whose full blocks were never
+		// stored; do not walk or load those bodies at all. An empty complete index
+		// is populated as subsequent bodies are applied.
+		if skip_start_blockchain_validation {
+			info!(
+				"init_spent_commitment_index: skipping rebuild because skip_start_blockchain_validation is set (partial archive; missing bodies expected)"
+			);
+			drop(batch);
+			return Self::init_empty_spent_commitment_record_index(store);
 		}
 
 		// `last_block_h` is the authoritative body HEAD selector; use its selected
@@ -4688,6 +5578,7 @@ impl Chain {
 				window_start,
 				canonical_headers,
 				stop_state,
+				skip_start_blockchain_validation,
 			);
 		}
 
@@ -4974,16 +5865,20 @@ impl Chain {
 		window_start: u64,
 		mut canonical_headers: Vec<BlockHeader>,
 		stop_state: Option<Arc<StopState>>,
+		allow_missing_bodies: bool,
 	) -> Result<(), Error> {
 		let now = Instant::now();
 		let context_id = store.get_context_id();
 		Self::set_spent_commitment_record_index_complete(store, false)?;
 		Self::clear_spent_commitment_index(store)?;
+		info!("spent occurrence index rebuild: will skip missing full blocks");
 
 		// The ancestry walk returns HEAD first. Rebuild oldest-to-newest so records
 		// for a reused commitment have stable body-chain order.
 		canonical_headers.reverse();
 		let mut processed = 0u64;
+		let mut skipped_missing = 0u64;
+		let mut first_missing: Option<(Hash, u64)> = None;
 		for chunk in canonical_headers.chunks(SPENT_COMMITMENT_INDEX_REBUILD_CHUNK_SIZE) {
 			if let Some(stop_state) = stop_state.as_ref() {
 				if stop_state.is_stopped() {
@@ -5001,6 +5896,7 @@ impl Chain {
 			let batch = store.batch_write().map_err(|e| {
 				Error::StoreErr(e, "spent occurrence index rebuild write batch".into())
 			})?;
+			let mut skipped_in_chunk = 0u64;
 			for header in chunk {
 				if header.height <= window_start {
 					return Err(Error::InvalidPersistedChainState(format!(
@@ -5009,11 +5905,46 @@ impl Chain {
 					)));
 				}
 				let block_hash = header.hash(context_id)?;
+				// Probe the store first. checked_block_for_header wraps NotFound in
+				// StoreErr with a reason string; matching only store_error_is_not_found
+				// has missed wrapped / Display-only not-found cases. Skip any missing
+				// full block, then authenticate hits against the canonical header.
+				let loaded_block = match batch.get_block(&block_hash) {
+					Ok(block) => block,
+					Err(e) => {
+						let msg = e.to_string();
+						if e.store_error_is_not_found()
+							|| msg.contains("Not Found")
+							|| msg.contains("not found")
+						{
+							// Partial archive / PIBD: BODY_HEAD can sit at HEADER_HEAD (or the
+							// archive snapshot) before the corresponding full blocks are stored.
+							// Skip those headers instead of aborting Chain::init.
+							if first_missing.is_none() {
+								first_missing = Some((block_hash, header.height));
+							}
+							skipped_missing += 1;
+							skipped_in_chunk += 1;
+							debug!(
+								"spent occurrence index rebuild: skipping canonical header {} at height {} with no full block",
+								block_hash, header.height
+							);
+							continue;
+						}
+						return Err(Error::StoreErr(
+							e,
+							format!(
+								"spent occurrence index rebuild load full block {}",
+								block_hash
+							),
+						));
+					}
+				};
 				let block = crate::checked_block_for_header(
 					context_id,
 					header,
 					"spent occurrence index rebuild canonical body",
-					|hash| batch.get_block(hash),
+					|_| Ok(loaded_block),
 				)?;
 				let spent = Self::load_spent_index_for_rebuild(&batch, block_hash, &block)?;
 				for (commitment, position) in &spent {
@@ -5038,23 +5969,60 @@ impl Chain {
 							)
 						})?;
 				}
+				processed += 1;
 			}
-			processed += chunk.len() as u64;
 			batch
 				.commit()
 				.map_err(|e| Error::StoreErr(e, "spent occurrence index rebuild commit".into()))?;
+			if skipped_in_chunk > 0 {
+				info!(
+					"spent occurrence index rebuild: skipped {} canonical headers with no full block in this chunk",
+					skipped_in_chunk
+				);
+			}
 			debug!(
-				"spent occurrence index rebuild: processed {} canonical blocks",
-				processed
+				"spent occurrence index rebuild: processed {} canonical blocks, skipped {}",
+				processed, skipped_missing
 			);
 		}
+
+		// Completeness:
+		// - no skips: every in-window body was applied, index is complete
+		// - no bodies at all: header-synced / PIBD snapshot, empty+complete is OK
+		//   because subsequent body apply populates the index as blocks land
+		// - mix of loaded and skipped: a hole in HEAD-claimed applied bodies;
+		//   never mark complete. Fail closed unless startup validation is skipped.
+		if skipped_missing > 0 && processed > 0 {
+			let (missing_hash, missing_height) = first_missing.expect("first missing body");
+			if !allow_missing_bodies {
+				return Err(Error::InvalidPersistedChainState(format!(
+					"spent occurrence index rebuild: canonical body {} at height {} is missing while {} in-window bodies were applied; HEAD claims a contiguous body chain",
+					missing_hash, missing_height, processed
+				)));
+			}
+			warn!(
+				"spent occurrence index rebuild: skipped {} missing full blocks ({} loaded, first hole {} at height {}); leaving spent index incomplete",
+				skipped_missing, processed, missing_hash, missing_height
+			);
+			return Ok(());
+		}
+
 		Self::set_spent_commitment_record_index_complete(store, true)?;
-		info!(
-			"Rebuilt spent occurrence index from {} canonical blocks above height {} in {}s",
-			processed,
-			window_start,
-			now.elapsed().as_secs()
-		);
+		if processed == 0 && skipped_missing > 0 {
+			info!(
+				"Initialized empty spent occurrence index: no full blocks in {} canonical headers above height {} in {}s",
+				skipped_missing,
+				window_start,
+				now.elapsed().as_secs()
+			);
+		} else {
+			info!(
+				"Rebuilt spent occurrence index from {} canonical blocks above height {} in {}s",
+				processed,
+				window_start,
+				now.elapsed().as_secs()
+			);
+		}
 		Ok(())
 	}
 
@@ -5734,12 +6702,42 @@ impl Chain {
 	}
 }
 
+fn should_skip_pibd_reset_recovery(
+	genesis: &Block,
+	store: &store::ChainStore,
+	archive_mode: bool,
+) -> Result<bool, Error> {
+	// Archive nodes (including the iOS/Android overlay-install path) retain
+	// historical full blocks. Completing PibdReset rebuilds txhashset and
+	// BODY_HEAD at genesis while keeping HEADER_HEAD, which destroys that body
+	// chain. Skip the reset and keep current HEAD/txhashset/blocks.
+	if archive_mode {
+		return Ok(true);
+	}
+	if cfg!(any(target_os = "ios", target_os = "android")) {
+		return Ok(true);
+	}
+	match store.head() {
+		Ok(head) if head.height > 0 => return Ok(true),
+		Ok(_) | Err(NotFoundErr(_)) => {}
+		Err(e) => return Err(Error::StoreErr(e, "pibd-reset retain check HEAD".into())),
+	}
+	let genesis_hash = genesis.hash(store.get_context_id())?;
+	store
+		.has_full_blocks_above_genesis(&genesis_hash)
+		.map_err(|e| Error::StoreErr(e, "pibd-reset retain check full blocks".into()))
+}
+
 fn mark_interrupted_pibd_for_recovery(
 	genesis: &Block,
 	store: &store::ChainStore,
 	txhashset: &TxHashSet,
+	archive_mode: bool,
 ) -> Result<(), Error> {
 	if store.pending_chain_operation()?.is_some() {
+		return Ok(());
+	}
+	if should_skip_pibd_reset_recovery(genesis, store, archive_mode)? {
 		return Ok(());
 	}
 
@@ -5852,7 +6850,14 @@ fn recover_pending_chain_operation(
 	secp: &Secp256k1,
 	pow_verifier: fn(u32, &BlockHeader) -> Result<(), pow::Error>,
 	stop_state: Option<Arc<StopState>>,
+	archive_mode: bool,
 ) -> Result<(), Error> {
+	if store.writes_frozen() {
+		store.note_map_full("recover_pending_chain_operation skipped (writes frozen)");
+		return Err(Error::Other(
+			"LMDB map is full; restart the node to grow the map".into(),
+		));
+	}
 	let op = match store.pending_chain_operation()? {
 		None => return Ok(()),
 		Some(op) => op,
@@ -5868,6 +6873,7 @@ fn recover_pending_chain_operation(
 		pow_verifier,
 		stop_state,
 		&op,
+		archive_mode,
 	)
 }
 
@@ -5880,7 +6886,34 @@ fn recover_marked_chain_operation(
 	pow_verifier: fn(u32, &BlockHeader) -> Result<(), pow::Error>,
 	stop_state: Option<Arc<StopState>>,
 	op: &PendingChainOperation,
+	archive_mode: bool,
 ) -> Result<(), Error> {
+	if matches!(op, PendingChainOperation::PibdReset)
+		&& should_skip_pibd_reset_recovery(genesis, store, archive_mode)?
+	{
+		warn!(
+			"Incomplete PibdReset would rebuild txhashset and BODY_HEAD at genesis while keeping HEADER_HEAD. refusing genesis reset on mobile; retaining existing chain data"
+		);
+		store.clear_pending_chain_operation()?;
+		return Ok(());
+	}
+
+	let skip_ancestry = match op {
+		PendingChainOperation::ReconcileHeads {
+			kind: ChainOperationKind::ProcessBlock,
+			..
+		} => {
+			let header_h = store.header_head().map(|tip| tip.height).unwrap_or(0);
+			let body_h = store.head().map(|tip| tip.height).unwrap_or(0);
+			crate::types::should_skip_process_block_ancestry_on_mobile(header_h, body_h)
+		}
+		_ => false,
+	};
+	crate::types::set_skip_process_block_header_ancestry(skip_ancestry);
+	if skip_ancestry {
+		crate::types::log_skip_process_block_ancestry();
+	}
+
 	let res = match op {
 		PendingChainOperation::PibdReset => reset_pibd_chain_state(
 			genesis,
@@ -5940,23 +6973,16 @@ fn recover_marked_chain_operation(
 			txhashset,
 			secp,
 			pow_verifier,
-			stop_state,
+			stop_state.clone(),
 		),
 	};
+	crate::types::set_skip_process_block_header_ancestry(false);
 
 	match res {
-		Ok(()) => {
-			store.clear_pending_chain_operation()?;
-			Ok(())
-		}
+		Ok(()) => store.clear_pending_chain_operation().map_err(Error::from),
 		Err(e) => {
-			// A marked-operation recovery failure means the code cannot prove that
-			// the durable DB selectors and PMMR files describe one state. Do not hide
-			// that failure by silently rebuilding the body at genesis. Keep the marker
-			// so every restart fails closed until the operator has investigated and
-			// explicitly cleaned, reset, or resynchronized the chain data.
 			error!(
-				"Failed to recover pending {:?}: {}. Automatic fallback reset is disabled; the pending marker is retained. Inspect the chain data and explicitly clean or reset it before restarting",
+				"Failed to recover pending {:?}: {}. Retaining the recovery marker and chain data",
 				op.kind(),
 				e
 			);
@@ -6934,6 +7960,324 @@ fn ensure_missing_head_is_fresh(
 	Err(Error::InvalidPersistedChainState(msg))
 }
 
+/// Whether a full block is stored for the canonical header at `height`.
+/// Missing headers or bodies are treated as absent, not as store corruption.
+fn stored_body_exists_at_height(
+	context_id: u32,
+	header_pmmr: &txhashset::PMMRHandle<BlockHeader>,
+	batch: &store::Batch<'_>,
+	height: u64,
+) -> Result<bool, Error> {
+	if height == 0 {
+		return Ok(true);
+	}
+	let hash = match header_pmmr.get_header_hash_by_height(height) {
+		Ok(hash) => hash,
+		Err(Error::InvalidHeaderHeight(_)) => return Ok(false),
+		Err(e) => {
+			let msg = e.to_string();
+			if msg.contains("not found") || msg.contains("Not Found") {
+				return Ok(false);
+			}
+			return Err(e);
+		}
+	};
+	let header = match batch.get_block_header(&hash) {
+		Ok(header) => header,
+		Err(e) if e.store_error_is_not_found() => return Ok(false),
+		Err(e) => {
+			return Err(Error::StoreErr(
+				e,
+				format!("resume body head load header {} at height {}", hash, height),
+			));
+		}
+	};
+	let actual_hash = header.hash(context_id)?;
+	if actual_hash != hash || header.height != height {
+		return Ok(false);
+	}
+	batch.block_exists(&hash).map_err(|e| {
+		Error::StoreErr(
+			e,
+			format!(
+				"resume body head block_exists {} at height {}",
+				hash, height
+			),
+		)
+	})
+}
+
+/// Highest height on the header chain whose full body is stored, assuming a
+/// contiguous prefix from genesis with at most a short hole near the tip.
+/// Binary search plus a bounded backward walk; not a linear scan of history.
+fn highest_contiguous_stored_body_height(
+	context_id: u32,
+	header_pmmr: &txhashset::PMMRHandle<BlockHeader>,
+	batch: &store::Batch<'_>,
+	header_head_height: u64,
+) -> Result<u64, Error> {
+	if header_head_height == 0 {
+		return Ok(0);
+	}
+	const MAX_HOLE_WALK: u64 = 64;
+	const MAX_SEARCH_ROUNDS: u32 = 8;
+	let exists = |height: u64| -> Result<bool, Error> {
+		stored_body_exists_at_height(context_id, header_pmmr, batch, height)
+	};
+	let mut hi = header_head_height;
+	for _ in 0..MAX_SEARCH_ROUNDS {
+		let mut lo = 0u64;
+		let mut search_hi = hi;
+		while lo < search_hi {
+			let mid = lo + (search_hi - lo + 1) / 2;
+			if exists(mid)? {
+				lo = mid;
+			} else {
+				search_hi = mid - 1;
+			}
+		}
+		if lo == 0 {
+			return Ok(0);
+		}
+		let mut n = lo;
+		let mut walked = 0u64;
+		while n > 0 && walked < MAX_HOLE_WALK {
+			if exists(n)? && (n == 1 || exists(n - 1)?) {
+				return Ok(n);
+			}
+			n -= 1;
+			walked += 1;
+		}
+		if n == 0 {
+			return Ok(0);
+		}
+		hi = n;
+	}
+	Ok(0)
+}
+
+fn load_header_at_height(
+	context_id: u32,
+	header_pmmr: &txhashset::PMMRHandle<BlockHeader>,
+	batch: &store::Batch<'_>,
+	height: u64,
+) -> Result<BlockHeader, Error> {
+	let hash = header_pmmr.get_header_hash_by_height(height)?;
+	let header = batch
+		.get_block_header(&hash)
+		.map_err(|e| Error::StoreErr(e, format!("load header at height {}", height)))?;
+	let actual = header.hash(context_id)?;
+	if actual != hash || header.height != height {
+		return Err(Error::InvalidPersistedChainState(format!(
+			"header at height {} hash mismatch: expected {}, loaded {} at {}",
+			height, hash, actual, header.height
+		)));
+	}
+	Ok(header)
+}
+
+fn pmmr_matches_header(txhashset: &txhashset::TxHashSet, header: &BlockHeader) -> bool {
+	txhashset.output_mmr_size() == header.output_mmr_size
+		&& txhashset.kernel_mmr_size() == header.kernel_mmr_size
+		&& txhashset.rangeproof_mmr_size() == header.output_mmr_size
+}
+
+/// Highest header height at which output, kernel, and rangeproof PMMR sizes
+/// all fit (each header size <= current PMMR size). That is the last fully
+/// applied body: a height matching only one MMR is not consistent. Genesis
+/// sizes resolve to height 0 so HEAD cannot jump ahead of a genesis-sized
+/// txhashset; callers must not adopt 0 unless the PMMRs are actually genesis.
+fn height_matching_pmmr_sizes(
+	context_id: u32,
+	header_pmmr: &txhashset::PMMRHandle<BlockHeader>,
+	txhashset: &txhashset::TxHashSet,
+	batch: &store::Batch<'_>,
+	search_hi: u64,
+) -> Result<u64, Error> {
+	let out = txhashset.output_mmr_size();
+	let kern = txhashset.kernel_mmr_size();
+	let rproof = txhashset.rangeproof_mmr_size();
+	let genesis = load_header_at_height(context_id, header_pmmr, batch, 0)?;
+	if genesis.output_mmr_size == out
+		&& genesis.kernel_mmr_size == kern
+		&& genesis.output_mmr_size == rproof
+	{
+		return Ok(0);
+	}
+	// Last consistent height is the max H whose header sizes all fit in the
+	// current PMMRs. A height that matches only output (or only kernel) is
+	// not consistent and must not be adopted as HEAD. Searching on every MMR
+	// being <= current size never requires a rewind-forward.
+	let mut lo = 0u64;
+	let mut hi = search_hi;
+	while lo < hi {
+		let mid = lo + (hi - lo + 1) / 2;
+		match load_header_at_height(context_id, header_pmmr, batch, mid) {
+			Ok(header) => {
+				if header.output_mmr_size <= out
+					&& header.kernel_mmr_size <= kern
+					&& header.output_mmr_size <= rproof
+				{
+					lo = mid;
+				} else if mid == 0 {
+					break;
+				} else {
+					hi = mid - 1;
+				}
+			}
+			Err(Error::InvalidHeaderHeight(_)) => {
+				if mid == 0 {
+					break;
+				}
+				hi = mid - 1;
+			}
+			Err(e) if e.is_not_found() => {
+				if mid == 0 {
+					break;
+				}
+				hi = mid - 1;
+			}
+			Err(e) => return Err(e),
+		}
+	}
+	Ok(lo)
+}
+
+/// Align BODY_HEAD with the last fully applied PMMR tip.
+///
+/// HEAD is only a height H where output, kernel, and rangeproof PMMR sizes all
+/// match header(H). A height that matches only one MMR is not adopted. If an
+/// MMR is ahead of that last consistent height, it is rewound backward (legal)
+/// to header(H) sizes so a later process_block can apply H+1 wholly.
+/// Stored bodies beyond the PMMR tip are replayed later.
+fn reconcile_body_head_with_pmmr(
+	context_id: u32,
+	header_pmmr: &mut txhashset::PMMRHandle<BlockHeader>,
+	txhashset: &mut txhashset::TxHashSet,
+	batch: &mut store::Batch<'_>,
+	current_head: &Tip,
+) -> Result<Option<Tip>, Error> {
+	let stored_header_head = match batch.header_head() {
+		Ok(head) => head,
+		Err(NotFoundErr(_)) => return Ok(None),
+		Err(e) => {
+			return Err(Error::StoreErr(
+				e,
+				"reconcile body head load HEADER_HEAD".into(),
+			));
+		}
+	};
+	let (_, header_head) = canonical_tip_header("HEADER_HEAD", &stored_header_head, batch)?;
+	let search_hi = header_head.height.max(current_head.height);
+	if search_hi == 0 {
+		return Ok(None);
+	}
+	let stored_n =
+		highest_contiguous_stored_body_height(context_id, header_pmmr, batch, header_head.height)?;
+	let pmmr_n = height_matching_pmmr_sizes(context_id, header_pmmr, txhashset, batch, search_hi)?;
+	if stored_n > pmmr_n {
+		static LAST_HEIGHT: AtomicU64 = AtomicU64::new(0);
+		static LAST_SECS: AtomicU64 = AtomicU64::new(0);
+		if take_info_rate_limit(&LAST_HEIGHT, &LAST_SECS, pmmr_n, 1000, 10) {
+			info!(
+				"PMMR behind stored bodies: output/kernel PMMR {}/{} match height {}, stored bodies reach {}",
+				txhashset.output_mmr_size(),
+				txhashset.kernel_mmr_size(),
+				pmmr_n,
+				stored_n
+			);
+		}
+	}
+	if pmmr_n == 0 {
+		let genesis = load_header_at_height(context_id, header_pmmr, batch, 0)?;
+		if !pmmr_matches_header(txhashset, &genesis) {
+			warn!(
+				"PMMR sizes {}/{} reported match height 0 but PMMR is not genesis; keeping HEAD {} (not adopting 0)",
+				txhashset.output_mmr_size(),
+				txhashset.kernel_mmr_size(),
+				current_head.height
+			);
+			return Ok(None);
+		}
+	}
+	// HEAD must never lead the last fully applied PMMR. Cap by the
+	// last-consistent tip; leftover stored bodies are replayed locally.
+	let n = min(stored_n, pmmr_n);
+	let header = load_header_at_height(context_id, header_pmmr, batch, n)?;
+	if n > 0 {
+		if let Err(e) =
+			crate::checked_block_for_header(context_id, &header, "reconcile body head", |h| {
+				batch.get_block(h)
+			}) {
+			warn!(
+				"reconcile body head: no stored body at consistent height {}: {}; not aborting start",
+				n, e
+			);
+		}
+	} else if !pmmr_matches_header(txhashset, &header) {
+		return Ok(None);
+	}
+
+	let out = txhashset.output_mmr_size();
+	let kern = txhashset.kernel_mmr_size();
+	let rproof = txhashset.rangeproof_mmr_size();
+	let ahead = out > header.output_mmr_size
+		|| kern > header.kernel_mmr_size
+		|| rproof > header.output_mmr_size;
+	if ahead {
+		let (inconsistent_at, expected_out, expected_kern) =
+			match load_header_at_height(context_id, header_pmmr, batch, current_head.height) {
+				Ok(claimed) => (
+					current_head.height,
+					claimed.output_mmr_size,
+					claimed.kernel_mmr_size,
+				),
+				Err(_) => (n, header.output_mmr_size, header.kernel_mmr_size),
+			};
+		warn!(
+			"PMMR inconsistent at height {} (output {} kernel {} vs header {}/{}); rewinding to last consistent height {}",
+			inconsistent_at, out, kern, expected_out, expected_kern, n
+		);
+		let out_ahead = out > header.output_mmr_size || rproof > header.output_mmr_size;
+		let kern_ahead = kern > header.kernel_mmr_size;
+		if let Err(e) = txhashset::extending(header_pmmr, txhashset, batch, |ext, ext_batch| {
+			ext.extension.rewind_ahead_mmrs_to_header(&header)?;
+			if out_ahead {
+				ext_batch.set_output_pos_index_complete(false)?;
+			}
+			if kern_ahead {
+				ext_batch.set_kernel_pos_index_complete(false)?;
+			}
+			Ok(())
+		}) {
+			warn!(
+				"PMMR rewind to last consistent height {} failed: {}; continuing with current PMMR sizes",
+				n, e
+			);
+		}
+	}
+
+	if n == current_head.height && !ahead {
+		return Ok(None);
+	}
+	let new_head = Tip::try_from_header(&header)?;
+	if n != current_head.height {
+		batch.save_body_head(&new_head)?;
+		if n > current_head.height {
+			info!(
+				"resuming body head from stored blocks at height {} (PMMR matches)",
+				n
+			);
+		} else {
+			info!(
+				"PMMR behind stored bodies: resetting HEAD from {} to {} so HEAD cannot lead PMMR",
+				current_head.height, n
+			);
+		}
+	}
+	Ok(Some(new_head))
+}
+
 fn setup_head(
 	genesis: &Block,
 	store: &store::ChainStore,
@@ -6991,19 +8335,34 @@ fn setup_head(
 		Ok(stored_head) => {
 			let (header, head) = canonical_tip_header("HEADER_HEAD", &stored_head, &batch)?;
 			header_pmmr.init_head(&head)?;
-			txhashset::header_extending(header_pmmr, &mut batch, |ext, batch| {
-				ext.rewind(&header)?;
-				if skip_start_blockchain_validation {
-					Ok(())
-				} else {
-					ext.validate_persisted_ancestry(
-						&header,
-						batch,
-						pow_verifier,
-						stop_state.as_deref(),
-					)
-				}
-			})?;
+			txhashset::header_extending_with_explicit_head(
+				header_pmmr,
+				&mut batch,
+				head.clone(),
+				|ext, batch| {
+					match ext.rewind(&header) {
+						Ok(()) => {}
+						Err(e) if skip_start_blockchain_validation => {
+							warn!(
+								"setup_head: header PMMR rewind failed at height {}: {}; continuing",
+								header.height, e
+							);
+							return Ok(());
+						}
+						Err(e) => return Err(e),
+					}
+					if skip_start_blockchain_validation {
+						Ok(())
+					} else {
+						ext.validate_persisted_ancestry(
+							&header,
+							batch,
+							pow_verifier,
+							stop_state.as_deref(),
+						)
+					}
+				},
+			)?;
 			if stored_head != head {
 				warn!(
 					"Repairing inconsistent HEADER_HEAD cache: stored {:?}, canonical {:?}",
@@ -7074,7 +8433,7 @@ fn setup_head(
 
 	// check if we have a head in store, otherwise the genesis block is it
 	let head_res = batch.head();
-	let head: Tip;
+	let mut head: Tip;
 	match head_res {
 		Ok(stored_head) => {
 			let (_, canonical_head) = canonical_tip_header("HEAD", &stored_head, &batch)?;
@@ -7086,6 +8445,21 @@ fn setup_head(
 				);
 				batch.save_body_head(&head)?;
 			}
+			// Align BODY_HEAD with the applied PMMR before any rewind. Adopting
+			// a stored-block height while output/kernel PMMR is still genesis
+			// leaves HEAD ahead of txhashset; applying the next body then tries
+			// to rewind the PMMR forward and fails.
+			if body_head_override.is_none() {
+				if let Some(reconciled) = reconcile_body_head_with_pmmr(
+					context_id,
+					header_pmmr,
+					txhashset,
+					&mut batch,
+					&head,
+				)? {
+					head = reconciled;
+				}
+			}
 			// Reconcile the PMMRs to the durable HEAD. Unless explicitly disabled,
 			// validate the selected block and all authenticated chain state exactly
 			// once; startup does not select an older block and retry after failure.
@@ -7095,122 +8469,154 @@ fn setup_head(
 				// If validation is successful we will truncate the backend files
 				// to match the provided block header.
 				let header = batch.get_block_header(&head.last_block_h)?;
-				if !skip_start_blockchain_validation {
-					crate::checked_block_for_header(
-						context_id,
-						&header,
-						"setup_head durable HEAD preflight",
-						|hash| batch.get_block(hash),
-					)?;
-				}
-				let output_mmr_size_before = txhashset.output_mmr_size();
-				let kernel_mmr_size_before = txhashset.kernel_mmr_size();
-				let body_pmmr_rewind_expected = output_mmr_size_before > header.output_mmr_size
-					|| kernel_mmr_size_before > header.kernel_mmr_size;
-
-				let res = txhashset::extending(header_pmmr, txhashset, &mut batch, |ext, batch| {
-					pipe::rewind_and_apply_fork(store.get_context_id(), &header, ext, batch, secp)?;
-
-					if skip_start_blockchain_validation {
-						debug!(
-							"init: rewound without startup blockchain validation... {} at {}",
-							header.hash(context_id)?,
-							header.height,
-						);
-						return Ok(());
-					}
-
-					let extension = &mut ext.extension;
-					// Authenticate persisted PMMR data against its hash trees and the
-					// selected header before trusting or rebuilding any derived cache.
-					// Fast validation still verifies the MMRs, roots, sizes, leaf-set
-					// pairing, and kernel sums; it skips only rangeproof and kernel
-					// signature verification.
-					let (utxo_sum, kernel_sum) = extension.validate(
-						&genesis.header,
-						true,
-						None,
-						&header,
-						stop_state.clone(),
-						secp,
-					)?;
-					// PMMR roots authenticate append history, but not the exact
-					// membership of the prunable output/rangeproof leaf sets. For a
-					// zero-step startup rewind, bind those leaf sets to the independently
-					// committed output_pos index before accepting the durable HEAD or
-					// rebuilding derived caches.
-					//
-					// If the backend is actually being rewound, output_pos still describes
-					// the pre-rewind state and is not a valid authentication anchor. The
-					// success path below marks it incomplete so Chain::init rebuilds it.
-					if !body_pmmr_rewind_expected {
-						extension.validate_output_pos_index(batch, &header)?;
-					}
-
-					let header_hash = header.hash(context_id)?;
-					let block_sums = if header.height == 0 {
-						genesis_block_sums(genesis, context_id, secp)?
-					} else {
-						BlockSums::new(utxo_sum, kernel_sum)
-					};
-					// BlockSums is a derived acceleration cache. Replace it from the
-					// validated txhashset rather than accepting any persisted value.
-					batch.save_block_sums(&header_hash, block_sums)?;
+				let pmmr_large = txhashset.output_mmr_size() > header.output_mmr_size
+					|| txhashset.kernel_mmr_size() > header.kernel_mmr_size
+					|| txhashset.rangeproof_mmr_size() > header.output_mmr_size;
+				let skip_body_pmmr_rewind = skip_start_blockchain_validation
+					&& body_head_override.is_none()
+					&& (pmmr_matches_header(txhashset, &header)
+						|| txhashset.output_mmr_size() < header.output_mmr_size
+						|| txhashset.kernel_mmr_size() < header.kernel_mmr_size
+						|| txhashset.rangeproof_mmr_size() < header.output_mmr_size
+						|| pmmr_large);
+				if skip_body_pmmr_rewind {
 					info!(
-						"setup_head: startup txhashset validation finished at height {}; synchronizing PMMR backends",
-						header.height
-					);
-
-					debug!(
-						"init: rewinding and validating before we start... {} at {}",
-						header.hash(context_id)?,
+						"setup_head: skipping body PMMR rewind at height {} (output/kernel PMMR {}/{}, header {}/{})",
 						header.height,
+						txhashset.output_mmr_size(),
+						txhashset.kernel_mmr_size(),
+						header.output_mmr_size,
+						header.kernel_mmr_size
 					);
-					Ok(())
-				});
-
-				match res {
-					Ok(()) => {
-						info!(
-							"setup_head: PMMR backend synchronization finished at height {}",
-							header.height
-						);
-						let output_mmr_size_after = txhashset.output_mmr_size();
-						let kernel_mmr_size_after = txhashset.kernel_mmr_size();
-						let output_mmr_rewound = output_mmr_size_before > output_mmr_size_after;
-						let kernel_mmr_rewound = kernel_mmr_size_before > kernel_mmr_size_after;
-						if output_mmr_rewound {
-							debug!(
-								"init: output PMMR rewound from {} to {}; marking output_pos index incomplete",
-								output_mmr_size_before, output_mmr_size_after
-							);
-							batch.set_output_pos_index_complete(false)?;
-						}
-						if kernel_mmr_rewound {
-							debug!(
-								"init: kernel PMMR rewound from {} to {}; marking kernel_pos index incomplete",
-								kernel_mmr_size_before, kernel_mmr_size_after
-							);
-							batch.set_kernel_pos_index_complete(false)?;
-						}
+				} else {
+					if !skip_start_blockchain_validation {
+						crate::checked_block_for_header(
+							context_id,
+							&header,
+							"setup_head durable HEAD preflight",
+							|hash| batch.get_block(hash),
+						)?;
 					}
-					Err(e) => {
-						if matches!(
-							&e,
-							Error::PMMRErr(mwc_core::core::pmmr::Error::DataCorruption(_))
-						) {
-							// The durable HEAD is operator-visible chain state. Do not
-							// silently select its parent and delete the corresponding block
-							// merely because local PMMR validation failed. The extension has
-							// already discarded its tentative changes; return the original
-							// corruption error and leave HEAD untouched so the operator can
-							// investigate and explicitly clean or reset the node data.
-							error!(
-								"PMMR corruption while validating durable HEAD {} at height {}: {}. Automatic block rollback is disabled; inspect the chain data and explicitly clean or reset it before restarting",
-								head.last_block_h, head.height, e
+					let output_mmr_size_before = txhashset.output_mmr_size();
+					let kernel_mmr_size_before = txhashset.kernel_mmr_size();
+					let body_pmmr_rewind_expected = output_mmr_size_before > header.output_mmr_size
+						|| kernel_mmr_size_before > header.kernel_mmr_size;
+
+					let res = txhashset::extending(
+						header_pmmr,
+						txhashset,
+						&mut batch,
+						|ext, batch| {
+							pipe::rewind_and_apply_fork(
+								store.get_context_id(),
+								&header,
+								ext,
+								batch,
+								secp,
+							)?;
+
+							if skip_start_blockchain_validation {
+								debug!(
+									"init: rewound without startup blockchain validation... {} at {}",
+									header.hash(context_id)?,
+									header.height,
+								);
+								return Ok(());
+							}
+
+							let extension = &mut ext.extension;
+							// Authenticate persisted PMMR data against its hash trees and the
+							// selected header before trusting or rebuilding any derived cache.
+							// Fast validation still verifies the MMRs, roots, sizes, leaf-set
+							// pairing, and kernel sums; it skips only rangeproof and kernel
+							// signature verification.
+							let (utxo_sum, kernel_sum) = extension.validate(
+								&genesis.header,
+								true,
+								None,
+								&header,
+								stop_state.clone(),
+								secp,
+							)?;
+							// PMMR roots authenticate append history, but not the exact
+							// membership of the prunable output/rangeproof leaf sets. For a
+							// zero-step startup rewind, bind those leaf sets to the independently
+							// committed output_pos index before accepting the durable HEAD or
+							// rebuilding derived caches.
+							//
+							// If the backend is actually being rewound, output_pos still describes
+							// the pre-rewind state and is not a valid authentication anchor. The
+							// success path below marks it incomplete so Chain::init rebuilds it.
+							if !body_pmmr_rewind_expected {
+								extension.validate_output_pos_index(batch, &header)?;
+							}
+
+							let header_hash = header.hash(context_id)?;
+							let block_sums = if header.height == 0 {
+								genesis_block_sums(genesis, context_id, secp)?
+							} else {
+								BlockSums::new(utxo_sum, kernel_sum)
+							};
+							// BlockSums is a derived acceleration cache. Replace it from the
+							// validated txhashset rather than accepting any persisted value.
+							batch.save_block_sums(&header_hash, block_sums)?;
+							info!(
+								"setup_head: startup txhashset validation finished at height {}; synchronizing PMMR backends",
+								header.height
 							);
+
+							debug!(
+								"init: rewinding and validating before we start... {} at {}",
+								header.hash(context_id)?,
+								header.height,
+							);
+							Ok(())
+						},
+					);
+
+					match res {
+						Ok(()) => {
+							info!(
+								"setup_head: PMMR backend synchronization finished at height {}",
+								header.height
+							);
+							let output_mmr_size_after = txhashset.output_mmr_size();
+							let kernel_mmr_size_after = txhashset.kernel_mmr_size();
+							let output_mmr_rewound = output_mmr_size_before > output_mmr_size_after;
+							let kernel_mmr_rewound = kernel_mmr_size_before > kernel_mmr_size_after;
+							if output_mmr_rewound {
+								debug!(
+									"init: output PMMR rewound from {} to {}; marking output_pos index incomplete",
+									output_mmr_size_before, output_mmr_size_after
+								);
+								batch.set_output_pos_index_complete(false)?;
+							}
+							if kernel_mmr_rewound {
+								debug!(
+									"init: kernel PMMR rewound from {} to {}; marking kernel_pos index incomplete",
+									kernel_mmr_size_before, kernel_mmr_size_after
+								);
+								batch.set_kernel_pos_index_complete(false)?;
+							}
 						}
-						return Err(e);
+						Err(e) => {
+							if matches!(
+								&e,
+								Error::PMMRErr(mwc_core::core::pmmr::Error::DataCorruption(_))
+							) {
+								// The durable HEAD is operator-visible chain state. Do not
+								// silently select its parent and delete the corresponding block
+								// merely because local PMMR validation failed. The extension has
+								// already discarded its tentative changes; return the original
+								// corruption error and leave HEAD untouched so the operator can
+								// investigate and explicitly clean or reset the node data.
+								error!(
+									"PMMR corruption while validating durable HEAD {} at height {}: {}. Automatic block rollback is disabled; inspect the chain data and explicitly clean or reset it before restarting",
+									head.last_block_h, head.height, e
+								);
+							}
+							return Err(e);
+						}
 					}
 				}
 			}
@@ -8029,6 +9435,248 @@ mod tests {
 		drop(chain);
 		drop(source);
 		clean_output_dir(&target_dir);
+		clean_output_dir(&source_dir);
+	}
+
+
+	#[test]
+	fn late_batch_locked_arrival_bounds_fallback_and_recovery() {
+		let source_dir = format!("target/late_batch_source_{}", std::process::id());
+		let source = mine_chain(&source_dir, 11);
+		let blocks: Vec<_> = (1..=10)
+			.map(|h| {
+				let header = source.get_header_by_height(h).unwrap();
+				source.get_block_for_header(&header).unwrap()
+			})
+			.collect();
+		let opts = Options::SKIP_POW | Options::SYNC;
+		for mode in [
+			"arrival", "staged_arrival", "invalid", "staged_invalid", "marker", "recovery", "replay", "bounds", "stop", "non_sync",
+		] {
+			if mode.starts_with("staged_") && option_env!("MWC_STAGE_SYNC_ORPHANS") == Some("0") {
+				continue;
+			}
+			let dir = format!("target/late_batch_{}_{}", mode, std::process::id());
+			let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+			let adapter = Arc::new(RecordingAdapter::default());
+			let mut chain = Arc::new(init_chain_with_recording_adapter(
+				&dir,
+				&secp,
+				source.genesis.clone(),
+				adapter.clone(),
+			));
+			for block in &blocks {
+				chain.process_block_header(&block.header, opts).unwrap();
+			}
+			if mode == "stop" {
+				let stop = Arc::new(StopState::new());
+				stop.stop();
+				Arc::get_mut(&mut chain).unwrap().stop_state = Some(stop);
+			}
+			chain
+				.process_block_batch_safety_depth
+				.store(0, Ordering::SeqCst);
+			let mut child = blocks[1].clone();
+			if mode == "invalid" || mode == "staged_invalid" {
+				child.body.outputs.clear();
+			}
+			let child_hash = child.hash(0).unwrap();
+			let insert = |block: Block| {
+				chain
+					.orphans
+					.add(
+						0,
+						Orphan {
+							block,
+							opts,
+							source_peers: std::iter::once("child-peer".to_owned()).collect(),
+							added: Instant::now(),
+						},
+					)
+					.unwrap()
+			};
+			if mode == "arrival" || mode == "staged_arrival" {
+				// Selection precedes arrival; the state writer is deliberately held.
+				// No sleeps: the channel establishes selection-before-insertion.
+				let writer = chain.header_pmmr.write();
+				let worker_chain = chain.clone();
+				let selected = vec![blocks[0].clone()];
+				let (ready_tx, ready_rx) = mpsc::channel();
+				let worker = std::thread::spawn(move || {
+					global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+					global::set_local_nrd_enabled(false);
+					let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+					ready_tx.send(()).unwrap();
+					worker_chain.process_block_multiple_inner(&mut secp, &selected, opts, true)
+				});
+				ready_rx.recv().unwrap();
+				if mode == "staged_arrival" {
+					// Must finish while writer is still held: admission must not wait
+					// for persistence, nor publish HEAD or an acceptance callback.
+					let peers = std::iter::once("child-peer".to_owned()).collect();
+					assert!(matches!(chain.process_block(&mut secp, child.clone(), opts, peers), Err(Error::Orphan(_))));
+					assert_eq!(chain.store.head().unwrap().height, 0);
+					assert!(adapter.accepted.read_recursive().is_empty());
+				} else {
+					insert(child);
+				}
+				drop(writer);
+				let tip = worker
+					.join()
+					.unwrap()
+					.ok()
+					.expect("late batch succeeds")
+					.unwrap();
+				let expected = if option_env!("MWC_LATE_BATCHING") == Some("0") {
+					1
+				} else {
+					2
+				};
+				assert_eq!(tip.height, expected);
+				assert_eq!(adapter.accepted.read_recursive().len(), expected as usize);
+				assert_eq!(chain.is_orphan(&child_hash), expected == 1);
+			} else if mode == "bounds" {
+				for b in &blocks[1..] {
+					insert(b.clone());
+				}
+				let writer = chain.header_pmmr.write();
+				let peers = HashSet::new();
+				assert!(!chain.stage_known_header_orphan(&blocks[0], opts, &peers).unwrap());
+				assert!(!chain.stage_known_header_orphan(&blocks[1], Options::SKIP_POW, &peers).unwrap());
+				assert!(!chain.stage_known_header_orphan(&blocks[9], opts, &peers).unwrap());
+				let mut unknown = blocks[1].clone();
+				let nonce = unknown.header.pow.proof.nonces.last_mut().unwrap();
+				*nonce = nonce.wrapping_add(1);
+				assert!(!chain.stage_known_header_orphan(&unknown, opts, &peers).unwrap());
+				chain.requires_init_recovery.store(true, Ordering::SeqCst);
+				assert!(!chain.stage_known_header_orphan(&blocks[1], opts, &peers).unwrap());
+				chain.requires_init_recovery.store(false, Ordering::SeqCst);
+				assert_eq!(
+					chain
+						.collect_late_batch(&writer, &blocks[..1])
+						.unwrap()
+						.len(),
+					7
+				);
+				assert!(chain
+					.collect_late_batch(&writer, &blocks[..8])
+					.unwrap()
+					.is_empty());
+				let mut stale_tail = blocks[0].clone();
+				let proof_nonce = stale_tail.header.pow.proof.nonces.last_mut().unwrap();
+				*proof_nonce = proof_nonce.wrapping_add(1);
+				assert!(chain
+					.collect_late_batch(&writer, &[stale_tail])
+					.unwrap()
+					.is_empty());
+				chain
+					.process_block_batch_safety_depth
+					.store(7, Ordering::SeqCst);
+				assert_eq!(
+					chain
+						.collect_late_batch(&writer, &blocks[..1])
+						.unwrap()
+						.len(),
+					1
+				);
+				chain
+					.process_block_batch_safety_depth
+					.store(9, Ordering::SeqCst);
+				assert!(chain
+					.collect_late_batch(&writer, &blocks[..1])
+					.unwrap()
+					.is_empty());
+			} else {
+				if mode == "staged_invalid" {
+					let writer = chain.header_pmmr.write();
+					let peers = std::iter::once("child-peer".to_owned()).collect();
+					assert!(matches!(chain.process_block(&mut secp, child.clone(), opts, peers), Err(Error::Orphan(_))));
+					drop(writer);
+				} else {
+					insert(child);
+				}
+				if mode == "marker" || mode == "recovery" {
+					chain
+						.fail_next_process_block_marker_clear
+						.store(true, Ordering::SeqCst);
+				}
+				if mode == "recovery" {
+					chain
+						.fail_next_committed_recovery_with_bad_data
+						.store(true, Ordering::SeqCst);
+				}
+				let live = mode != "replay";
+				let expanded = live
+					&& mode != "stop"
+					&& mode != "non_sync"
+					&& option_env!("MWC_LATE_BATCHING") != Some("0");
+				let result = chain.process_block_multiple_inner(
+					&mut secp,
+					&vec![blocks[0].clone()],
+					if mode == "non_sync" {
+						Options::SKIP_POW
+					} else {
+						opts
+					},
+					live,
+				);
+				if (mode == "invalid" || mode == "staged_invalid") && expanded {
+					assert!(matches!(result, Err(BlockProcessingError::NotCommitted(_))));
+					chain.ensure_chain_robust().unwrap();
+					assert_eq!(chain.head().unwrap().height, 0);
+					assert!(chain.is_orphan(&child_hash));
+					chain
+						.process_block(
+							&mut secp,
+							blocks[0].clone(),
+							opts,
+							std::iter::once("parent-peer".to_owned()).collect(),
+						)
+						.unwrap();
+					assert_eq!(chain.head().unwrap().height, 1);
+					let rejected = adapter.rejected.read_recursive();
+					assert_eq!(rejected.len(), 1);
+					assert_eq!(rejected[0].0, child_hash);
+					assert_eq!(
+						rejected[0].1,
+						std::iter::once("child-peer".to_owned()).collect()
+					);
+				} else if mode == "recovery" {
+					assert!(matches!(
+						result,
+						Err(BlockProcessingError::CommittedRecoveryFailed(_))
+					));
+					assert_eq!(
+						chain.store.head().unwrap().height,
+						if expanded { 2 } else { 1 }
+					);
+					assert!(chain.is_orphan(&child_hash));
+					assert!(adapter.accepted.read_recursive().is_empty());
+					chain.ensure_chain_robust().unwrap();
+				} else {
+					assert_eq!(
+						result.ok().expect("batch succeeds").unwrap().height,
+						if expanded { 2 } else { 1 }
+					);
+					assert_eq!(chain.is_orphan(&child_hash), !expanded);
+					assert!(chain.store.pending_chain_operation().unwrap().is_none());
+				}
+			}
+			let persisted_height = chain.store.head().unwrap().height;
+			drop(chain);
+			if mode == "arrival" || mode == "staged_arrival" || mode == "marker" {
+				let reopened = init_chain_with_recording_adapter(
+					&dir,
+					&secp,
+					source.genesis.clone(),
+					Arc::new(RecordingAdapter::default()),
+				);
+				assert_eq!(reopened.head().unwrap().height, persisted_height);
+				drop(reopened);
+			}
+			clean_output_dir(&dir);
+		}
+		drop(source);
 		clean_output_dir(&source_dir);
 	}
 
@@ -10069,6 +11717,7 @@ mod tests {
 				&secp,
 				pow::verify_size,
 				None,
+				false,
 			)
 			.unwrap_err();
 			assert!(matches!(
@@ -10168,6 +11817,7 @@ mod tests {
 				&secp,
 				pow::verify_size,
 				None,
+				false,
 			)
 			.unwrap_err();
 			let details = match err {
@@ -10278,6 +11928,7 @@ mod tests {
 				&secp,
 				pow::verify_size,
 				None,
+				false,
 			)
 			.unwrap_err();
 			let details = match err {
@@ -10394,6 +12045,7 @@ mod tests {
 				pow::verify_size,
 				None,
 				&op,
+				false,
 			)
 			.unwrap_err();
 			assert!(
@@ -11577,6 +13229,272 @@ mod tests {
 	}
 
 	#[test]
+	fn archive_replay_reconciles_head_even_when_zero_blocks_applied() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let mut chain = mine_chain(dir.path().to_str().unwrap(), 4);
+		chain.archive_mode = true;
+		let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+		// Archive catch-up has headers ahead of bodies; retain a header-only
+		// successor so replay terminates on missing body, not out-of-range height.
+		let next = chain.head_header().unwrap();
+		let previous = chain.get_previous_header(&next).unwrap();
+		chain.reset_chain_head(&secp, &previous, false).unwrap();
+		let batch = chain.store.batch_write().unwrap();
+		batch.delete_block(&next.hash(0).unwrap()).unwrap();
+		batch.commit().unwrap();
+		let committed = chain.head().unwrap();
+		assert!(committed.height > 0);
+		assert_eq!(chain.replay_stored_bodies(&mut secp, 32).unwrap(), 0);
+		assert_eq!(chain.head().unwrap(), committed);
+		assert!(chain
+			.resume_body_head_from_stored_blocks()
+			.unwrap()
+			.is_none());
+		assert_eq!(
+			chain
+				.replay_stored_bodies_after_reconcile(&mut secp, 32)
+				.unwrap(),
+			0
+		);
+		assert_eq!(chain.head().unwrap(), committed);
+
+		// Reconciliation, not replay, restores a stale persisted HEAD. The
+		// caller must refresh HEAD even when the returned applied count is zero.
+		let batch = chain.store.batch_write().unwrap();
+		batch
+			.save_body_head(&Tip::try_from_header(&chain.genesis.header).unwrap())
+			.unwrap();
+		batch.commit().unwrap();
+		assert_eq!(chain.head().unwrap().height, 0);
+		assert_eq!(chain.replay_stored_bodies(&mut secp, 32).unwrap(), 0);
+		assert_eq!(chain.head().unwrap(), committed);
+
+		// A stopped replay does no work. The BodySync shutdown branch retains
+		// its explicit reconciliation instead of relying on this early exit.
+		let stop = Arc::new(StopState::new());
+		stop.stop();
+		chain.stop_state = Some(stop);
+		assert_eq!(chain.replay_stored_bodies(&mut secp, 32).unwrap(), 0);
+		assert_eq!(chain.head().unwrap(), committed);
+		assert!(chain
+			.resume_body_head_from_stored_blocks()
+			.unwrap()
+			.is_none());
+	}
+
+	#[test]
+	fn archive_replay_preserves_reconciliation_errors() {
+		let dir = mwc_crates::tempfile::tempdir().unwrap();
+		let mut chain = mine_chain(dir.path().to_str().unwrap(), 3);
+		chain.archive_mode = true;
+		let mut secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+		let committed = chain.head().unwrap();
+		let mut invalid = chain.header_head().unwrap();
+		invalid.last_block_h = Hash::from_vec(&[0xAB; 32]);
+		let batch = chain.store.batch_write().unwrap();
+		batch.save_header_head(&invalid).unwrap();
+		batch.commit().unwrap();
+		// Both the explicit reconciliation and the standalone replay API must
+		// reject malformed persisted headers rather than report success.
+		assert!(chain.resume_body_head_from_stored_blocks().is_err());
+		assert!(chain.replay_stored_bodies(&mut secp, 32).is_err());
+		assert_eq!(chain.head().unwrap(), committed);
+	}
+
+	#[test]
+	fn setup_head_resumes_body_head_from_stored_blocks_when_skipping_validation() {
+		let chain_dir = format!(
+			"target/setup_head_resumes_body_head_from_stored_blocks_{}",
+			std::process::id()
+		);
+		clean_output_dir(&chain_dir);
+		let chain = mine_chain(&chain_dir, 6);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+		let genesis = chain.genesis.clone();
+		let expected_height = chain.head().unwrap().height;
+		assert!(
+			expected_height >= 4,
+			"need a stored body prefix, got {}",
+			expected_height
+		);
+		let hole_header = chain.get_header_by_height(expected_height).unwrap();
+
+		{
+			let batch = chain.store.batch_write().unwrap();
+			batch
+				.save_body_head(&Tip::try_from_header(&genesis.header).unwrap())
+				.unwrap();
+			batch.commit().unwrap();
+		}
+		assert_eq!(chain.head().unwrap().height, 0);
+
+		{
+			let mut header_pmmr = chain.header_pmmr.write();
+			let mut txhashset = chain.txhashset.write();
+			setup_head(
+				&genesis,
+				&chain.store,
+				&mut header_pmmr,
+				&mut txhashset,
+				&secp,
+				pow::verify_size,
+				None,
+				true,
+				None,
+			)
+			.unwrap();
+		}
+		assert_eq!(
+			chain.head().unwrap().height,
+			expected_height,
+			"BODY_HEAD should resume at the highest contiguous stored body"
+		);
+
+		// A missing tip body should resume at the height below the hole.
+		{
+			let batch = chain.store.batch_write().unwrap();
+			batch.delete_block(&hole_header.hash(0).unwrap()).unwrap();
+			batch
+				.save_body_head(&Tip::try_from_header(&genesis.header).unwrap())
+				.unwrap();
+			batch.commit().unwrap();
+		}
+		{
+			let mut header_pmmr = chain.header_pmmr.write();
+			let mut txhashset = chain.txhashset.write();
+			setup_head(
+				&genesis,
+				&chain.store,
+				&mut header_pmmr,
+				&mut txhashset,
+				&secp,
+				pow::verify_size,
+				None,
+				true,
+				None,
+			)
+			.unwrap();
+		}
+		assert_eq!(chain.head().unwrap().height, expected_height - 1);
+
+		drop(chain);
+		let _ = fs::remove_dir_all(&chain_dir);
+	}
+
+	#[test]
+	fn setup_head_does_not_adopt_stored_bodies_when_pmmr_is_genesis() {
+		let chain_dir = format!(
+			"target/setup_head_pmmr_behind_stored_bodies_{}",
+			std::process::id()
+		);
+		clean_output_dir(&chain_dir);
+		let chain = mine_chain(&chain_dir, 6);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+		let genesis = chain.genesis.clone();
+		let stored_height = chain.head().unwrap().height;
+		assert!(stored_height >= 4);
+		assert_eq!(chain.header_head().unwrap().height, stored_height);
+
+		{
+			let mut header_pmmr = chain.header_pmmr.write();
+			let mut txhashset = chain.txhashset.write();
+			let mut batch = chain.store.batch_write().unwrap();
+			txhashset::extending(
+				&mut header_pmmr,
+				&mut txhashset,
+				&mut batch,
+				|ext, batch| {
+					ext.extension.reset_prune_lists()?;
+					ext.extension
+						.rebuild_genesis(&genesis, ext.header_extension, batch)?;
+					batch.save_body_head(&Tip::try_from_header(&genesis.header).unwrap())?;
+					Ok(())
+				},
+			)
+			.unwrap();
+			txhashset.init_output_pos_index(&batch, None, None).unwrap();
+			txhashset
+				.init_recent_kernel_pos_index(&batch, None, None)
+				.unwrap();
+			batch.commit().unwrap();
+			assert_eq!(txhashset.output_mmr_size(), genesis.header.output_mmr_size);
+			assert_eq!(txhashset.kernel_mmr_size(), genesis.header.kernel_mmr_size);
+		}
+		assert_eq!(chain.header_head().unwrap().height, stored_height);
+		assert_eq!(
+			chain.get_header_by_height(stored_height).unwrap().height,
+			stored_height
+		);
+		assert!(chain
+			.get_block_for_header(&chain.get_header_by_height(stored_height).unwrap())
+			.is_ok());
+
+		{
+			let mut header_pmmr = chain.header_pmmr.write();
+			let mut txhashset = chain.txhashset.write();
+			setup_head(
+				&genesis,
+				&chain.store,
+				&mut header_pmmr,
+				&mut txhashset,
+				&secp,
+				pow::verify_size,
+				None,
+				true,
+				None,
+			)
+			.unwrap();
+			assert_eq!(txhashset.output_mmr_size(), genesis.header.output_mmr_size);
+		}
+		assert_eq!(
+			chain.head().unwrap().height,
+			0,
+			"HEAD must not lead a genesis-sized PMMR"
+		);
+
+		{
+			let tip = chain.get_header_by_height(stored_height).unwrap();
+			let batch = chain.store.batch_write().unwrap();
+			batch
+				.save_body_head(&Tip::try_from_header(&tip).unwrap())
+				.unwrap();
+			batch.commit().unwrap();
+		}
+		assert_eq!(chain.head().unwrap().height, stored_height);
+		{
+			let mut header_pmmr = chain.header_pmmr.write();
+			let mut txhashset = chain.txhashset.write();
+			setup_head(
+				&genesis,
+				&chain.store,
+				&mut header_pmmr,
+				&mut txhashset,
+				&secp,
+				pow::verify_size,
+				None,
+				true,
+				None,
+			)
+			.unwrap();
+		}
+		assert_eq!(
+			chain.head().unwrap().height,
+			0,
+			"HEAD already ahead of genesis PMMR must be reset"
+		);
+		assert_eq!(chain.header_head().unwrap().height, stored_height);
+		assert!(
+			chain
+				.get_block_for_header(&chain.get_header_by_height(1).unwrap())
+				.is_ok(),
+			"stored bodies must remain so they can be replayed without the network"
+		);
+
+		drop(chain);
+		let _ = fs::remove_dir_all(&chain_dir);
+	}
+
+	#[test]
 	fn setup_head_repairs_header_and_body_tip_caches_from_headers() {
 		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 		global::set_local_nrd_enabled(false);
@@ -11687,7 +13605,7 @@ mod tests {
 			batch.commit().unwrap();
 		}
 
-		Chain::init_spent_commitment_index(&store, None).unwrap();
+		Chain::init_spent_commitment_index(&store, None, false).unwrap();
 		let batch = store.batch_read().unwrap();
 		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
 		assert_eq!(
@@ -11769,7 +13687,7 @@ mod tests {
 			batch.commit().unwrap();
 		}
 
-		Chain::init_spent_commitment_index(&store, None).unwrap();
+		Chain::init_spent_commitment_index(&store, None, false).unwrap();
 		let batch = store.batch_read().unwrap();
 		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
 		assert!(batch
@@ -11834,7 +13752,7 @@ mod tests {
 		// The persisted Tip height is corrupted to 0. The canonical head is
 		// selected by `last_block_h`, so its real height drives a rebuild rather
 		// than the genesis empty-index path.
-		Chain::init_spent_commitment_index(&store, None).unwrap();
+		Chain::init_spent_commitment_index(&store, None, false).unwrap();
 		let batch = store.batch_read().unwrap();
 		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
 		assert_eq!(
@@ -11897,7 +13815,7 @@ mod tests {
 			batch.commit().unwrap();
 		}
 
-		let err = Chain::init_spent_commitment_index(&store, None).unwrap_err();
+		let err = Chain::init_spent_commitment_index(&store, None, false).unwrap_err();
 		assert!(matches!(
 			err,
 			Error::InvalidPersistedChainState(msg)
@@ -11991,7 +13909,7 @@ mod tests {
 			batch.commit().unwrap();
 		}
 
-		Chain::init_spent_commitment_index(&store, None).unwrap();
+		Chain::init_spent_commitment_index(&store, None, false).unwrap();
 		let batch = store.batch_read().unwrap();
 		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
 		// Below the window: no record is rebuilt even though the block and its
@@ -12058,7 +13976,7 @@ mod tests {
 			batch.commit().unwrap();
 		}
 
-		let err = Chain::init_spent_commitment_index(&store, None).unwrap_err();
+		let err = Chain::init_spent_commitment_index(&store, None, false).unwrap_err();
 		assert!(matches!(err, Error::StoreErr(..)));
 		let batch = store.batch_read().unwrap();
 		assert!(!batch.is_spent_commitment_record_index_complete().unwrap());
@@ -12108,6 +14026,174 @@ mod tests {
 		assert!(matches!(err, Error::SpentCommitmentIndexIncomplete));
 
 		drop(chain);
+		let _ = fs::remove_dir_all(&chain_dir);
+	}
+
+	#[test]
+	fn init_spent_commitment_index_rebuild_skips_missing_horizon_bodies() {
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		global::set_local_nrd_enabled(false);
+		let chain_dir = format!(
+			"target/init_spent_commitment_index_rebuild_skips_missing_horizon_bodies_{}",
+			std::process::id()
+		);
+		let _ = fs::remove_dir_all(&chain_dir);
+		let store = ChainStore::new(0, &chain_dir).unwrap();
+
+		// HEAD at height 10 with headers only models PIBD / header-ahead archive
+		// state: BODY_HEAD sits at the snapshot while no in-window full blocks exist.
+		let genesis = Block::default(0);
+		let mut headers = vec![genesis.header.clone()];
+		let mut prev_hash = genesis.hash(0).unwrap();
+		for height in 1..=10 {
+			let block = retained_test_block(height, prev_hash, 200 + height);
+			prev_hash = block.hash(0).unwrap();
+			headers.push(block.header);
+		}
+		let head_header = headers.last().unwrap().clone();
+
+		{
+			let batch = store.batch_write().unwrap();
+			for header in &headers {
+				batch.save_block_header(header).unwrap();
+			}
+			batch
+				.save_body_head(&Tip::try_from_header(&head_header).unwrap())
+				.unwrap();
+			batch.commit().unwrap();
+		}
+
+		Chain::init_spent_commitment_index(&store, None, false).unwrap();
+		let batch = store.batch_read().unwrap();
+		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
+
+		drop(batch);
+		drop(store);
+		let _ = fs::remove_dir_all(&chain_dir);
+	}
+
+	#[test]
+	fn init_spent_commitment_index_skip_validation_does_not_rebuild() {
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		global::set_local_nrd_enabled(false);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit).unwrap();
+		let chain_dir = format!(
+			"target/init_spent_commitment_index_skip_validation_does_not_rebuild_{}",
+			std::process::id()
+		);
+		let _ = fs::remove_dir_all(&chain_dir);
+		let store = ChainStore::new(0, &chain_dir).unwrap();
+		let spent_commitment = secp.commit_value(73).unwrap();
+
+		let genesis = Block::default(0);
+		let mut blocks = vec![genesis.clone()];
+		let mut prev_hash = genesis.hash(0).unwrap();
+		for height in 1..=6 {
+			let mut block = retained_test_block(height, prev_hash, 300 + height);
+			if height == 2 {
+				block.body.inputs = Inputs::FeaturesAndCommit(vec![Input::new(
+					OutputFeatures::Plain,
+					spent_commitment,
+				)]);
+			}
+			prev_hash = block.hash(0).unwrap();
+			blocks.push(block);
+		}
+		let head_block = &blocks[6];
+		let spent_hash = blocks[2].hash(0).unwrap();
+
+		{
+			let batch = store.batch_write().unwrap();
+			for block in &blocks {
+				batch.save_block_header(&block.header).unwrap();
+			}
+			// Full bodies exist only through height 3; 4..=6 are header-only holes
+			// under a HEAD that claims them.
+			for block in &blocks[..=3] {
+				batch.save_block(block).unwrap();
+			}
+			batch
+				.save_spent_index(
+					&spent_hash,
+					&[SpentOutput {
+						commitment: spent_commitment,
+						position: CommitPos { pos: 1, height: 0 },
+					}],
+				)
+				.unwrap();
+			batch
+				.save_body_head(&Tip::try_from_header(&head_block.header).unwrap())
+				.unwrap();
+			batch.commit().unwrap();
+		}
+
+		Chain::init_spent_commitment_index(&store, None, true).unwrap();
+		let batch = store.batch_read().unwrap();
+		// skip_start_blockchain_validation must not walk full blocks at all.
+		// The resulting empty index is marked complete; later applies fill it.
+		assert!(batch.is_spent_commitment_record_index_complete().unwrap());
+		assert_eq!(
+			batch.get_spent_commitments(&spent_commitment).unwrap(),
+			None
+		);
+		let _ = spent_hash;
+
+		drop(batch);
+		drop(store);
+		let _ = fs::remove_dir_all(&chain_dir);
+	}
+
+	#[test]
+	fn init_spent_commitment_index_rebuild_rejects_body_holes_without_skip_flag() {
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		global::set_local_nrd_enabled(false);
+		let chain_dir = format!(
+			"target/init_spent_commitment_index_rebuild_rejects_body_holes_without_skip_flag_{}",
+			std::process::id()
+		);
+		let _ = fs::remove_dir_all(&chain_dir);
+		let store = ChainStore::new(0, &chain_dir).unwrap();
+
+		let genesis = Block::default(0);
+		let mut blocks = vec![genesis.clone()];
+		let mut prev_hash = genesis.hash(0).unwrap();
+		for height in 1..=6 {
+			let block = retained_test_block(height, prev_hash, 400 + height);
+			prev_hash = block.hash(0).unwrap();
+			blocks.push(block);
+		}
+		let head_block = &blocks[6];
+
+		{
+			let batch = store.batch_write().unwrap();
+			for block in &blocks {
+				batch.save_block_header(&block.header).unwrap();
+			}
+			for block in &blocks[..=3] {
+				batch.save_block(block).unwrap();
+			}
+			batch
+				.save_body_head(&Tip::try_from_header(&head_block.header).unwrap())
+				.unwrap();
+			batch.commit().unwrap();
+		}
+
+		let err = Chain::init_spent_commitment_index(&store, None, false).unwrap_err();
+		match err {
+			Error::InvalidPersistedChainState(msg) => {
+				assert!(
+					msg.contains("missing while") && msg.contains("in-window bodies were applied"),
+					"{}",
+					msg
+				);
+			}
+			other => panic!("unexpected error: {:?}", other),
+		}
+		let batch = store.batch_read().unwrap();
+		assert!(!batch.is_spent_commitment_record_index_complete().unwrap());
+
+		drop(batch);
+		drop(store);
 		let _ = fs::remove_dir_all(&chain_dir);
 	}
 

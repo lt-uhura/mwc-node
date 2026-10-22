@@ -940,6 +940,16 @@ impl Block {
 		Ok(())
 	}
 
+	/// Best-effort bounded proof preverification. This does not validate blocks:
+	/// callers must still run normal full validation on every block afterward.
+	pub fn preverify_sync_proofs(blocks: &[Block], secp: &mut Secp256k1) {
+		#[cfg(any(target_os = "ios", test, feature = "test-proof-cache"))]
+		if option_env!("MWC_CROSS_BLOCK_PROOFS") != Some("0") {
+			super::proof_cache::prime(blocks, secp);
+		}
+		let _ = (blocks, secp);
+	}
+
 	fn block_kernel_offset(
 		&self,
 		prev_kernel_offset: BlindingFactor,
@@ -970,6 +980,7 @@ impl Block {
 	) -> Result<Commitment, Error> {
 		self.body.validate(context_id, Weighting::AsBlock, secp)?;
 
+		let mut timing = util::sync_diagnostics::Metric::ValidationBlockRest.start();
 		self.verify_kernel_lock_heights()?;
 		self.verify_nrd_kernels_for_header_version(context_id)?;
 		self.verify_coinbase(context_id, secp)?;
@@ -982,6 +993,7 @@ impl Block {
 			secp,
 		)?;
 
+		timing.success();
 		Ok(kernel_sum)
 	}
 

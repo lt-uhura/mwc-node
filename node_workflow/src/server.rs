@@ -22,16 +22,17 @@ use mwc_crates::http;
 use mwc_crates::http_body_util::Full;
 use mwc_crates::hyper::service::Service;
 use mwc_crates::lazy_static::lazy_static;
-use mwc_crates::log::error;
+use mwc_crates::log::{error, info, warn};
 use mwc_crates::parking_lot::{Condvar, Mutex, RwLock};
 use mwc_crates::secp::{ContextFlag, Secp256k1};
-use mwc_p2p::tor::arti;
 use mwc_p2p::TorConfig;
+use mwc_p2p::tor::arti;
 use mwc_servers::{Server, ServerConfig, ServerStats};
 use mwc_util::StopState;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 lazy_static! {
 		/// Global chain status flags. It is expected that init call will set them first for every needed context
@@ -270,6 +271,90 @@ pub fn tor_status() -> (bool, bool) {
 	(arti::is_arti_started(), arti::is_arti_healthy())
 }
 
+fn start_stored_body_replay(context_id: u32, stop_state: Arc<StopState>) {
+	let chain = SERVER_CONTEXT
+		.read_recursive()
+		.get(&context_id)
+		.map(|registered| registered.server.chain.clone());
+	let Some(chain) = chain else {
+		return;
+	};
+	let stop = stop_state;
+	if let Err(e) = std::thread::Builder::new()
+		.name("stored-body-replay".into())
+		.spawn(move || {
+			let mut secp = match Secp256k1::with_caps(ContextFlag::Commit) {
+				Ok(secp) => secp,
+				Err(e) => {
+					error!("stored-body-replay: secp failed: {}", e);
+					return;
+				}
+			};
+			while !stop.is_stopped() {
+				match chain.replay_stored_bodies(&mut secp, 8) {
+					Ok(0) => {
+						// is_known_block / concurrent apply can yield 0 while the
+						// next stored body still exists. Do not exit forever.
+						match chain.has_stored_body_after_head() {
+							Ok(true) => {
+								std::thread::sleep(Duration::from_millis(50));
+								continue;
+							}
+							Ok(false) => break,
+							Err(e) => {
+								warn!("stored-body-replay: {}", e);
+								break;
+							}
+						}
+					}
+					Ok(applied) => {
+						info!(
+							"PMMR behind stored bodies: background replay applied {}",
+							applied
+						);
+					}
+					Err(e) if e.is_known_block() => match chain.has_stored_body_after_head() {
+						Ok(true) => {
+							std::thread::sleep(Duration::from_millis(50));
+							continue;
+						}
+						Ok(false) => break,
+						Err(e) => {
+							warn!("stored-body-replay: {}", e);
+							break;
+						}
+					},
+					Err(e) => {
+						warn!("stored-body-replay: {}", e);
+						match chain.has_stored_body_after_head() {
+							Ok(true) => {
+								std::thread::sleep(Duration::from_secs(2));
+								continue;
+							}
+							Ok(false) => break,
+							Err(e2) => {
+								warn!("stored-body-replay: {}", e2);
+								break;
+							}
+						}
+					}
+				}
+			}
+			if stop.is_stopped() {
+				if let Ok(true) = chain.has_stored_body_after_head() {
+					let head_height = chain.head().map(|h| h.height).unwrap_or(0);
+					warn!(
+						"stored-body replay aborted by shutdown at height {}, HEAD remains {}",
+						head_height.saturating_add(1),
+						head_height
+					);
+				}
+			}
+		}) {
+		warn!("stored-body-replay: failed to spawn ({})", e);
+	}
+}
+
 /// Create a new server instance. No jobs will be started.
 ///
 /// The provided stop state is registered before chain initialization begins,
@@ -309,6 +394,10 @@ pub fn create_server(
 		}
 	};
 
+	// The iOS service serializes stop/start and joins the old node before this
+	// point. Do not reset process-wide diagnostics for desktop multi-node users.
+	#[cfg(target_os = "ios")]
+	mwc_util::sync_diagnostics::begin_session();
 	let serv = match Server::create_server(
 		&secp,
 		context_id,
@@ -339,6 +428,7 @@ pub fn create_server(
 	SERVER_CONTEXT
 		.write()
 		.insert(context_id, RegisteredServer::new(serv));
+	start_stored_body_replay(context_id, stop_state.clone());
 	if stop_state.is_stopped() {
 		let serv = SERVER_CONTEXT
 			.write()
@@ -582,6 +672,27 @@ pub fn start_dandelion(context_id: u32) -> Result<(), Error> {
 	Ok(())
 }
 
+/// Inspect or explicitly change a node-local fixed checkpoint via the embedded API.
+pub fn local_checkpoint(context_id: u32, action: &str, value: u64, expected_hash: &str, depth: Option<u64>) -> Result<(Option<mwc_chain::Tip>, bool, Option<u64>), Error> {
+	let servers = SERVER_CONTEXT.read_recursive();
+	let server = servers.get(&context_id).ok_or_else(|| Error::ServerError("Node is not running".into()))?;
+	let chain = &server.server.chain;
+	if matches!(action, "preview" | "set" | "set_rolling") && server.server.sync_state.is_syncing() {
+		return Err(Error::ServerError("Wait for the node to finish syncing before selecting a checkpoint".into()));
+	}
+	let result = match action {
+		"get" => chain.local_checkpoint(),
+		"preview" => chain.preview_local_checkpoint(value).map(Some),
+		"set" => chain.set_local_checkpoint(value, expected_hash).map(Some),
+		"set_rolling" => chain.configure_local_checkpoint(value, expected_hash,
+			Some(depth.ok_or_else(|| Error::ServerError("Missing rolling checkpoint depth".into()))?)).map(Some),
+		"freeze" => chain.freeze_local_checkpoint(),
+		"clear" => chain.clear_local_checkpoint().map(|_| None),
+		_ => return Err(Error::ServerError("Unknown checkpoint action".into())),
+	}.map_err(|e| Error::ServerError(e.to_string()))?;
+	Ok((result, chain.local_checkpoint_conflict(), chain.rolling_checkpoint_depth().map_err(|e| Error::ServerError(e.to_string()))?))
+}
+
 /// Get server stats data, used by node UI.
 pub fn get_server_stats(context_id: u32) -> Result<ServerStats, Error> {
 	match SERVER_CONTEXT.try_read_recursive() {
@@ -602,7 +713,7 @@ pub fn get_server_stats(context_id: u32) -> Result<ServerStats, Error> {
 mod tests {
 	use super::*;
 	use mwc_api::{Handler, ResponseFuture};
-	use std::sync::{mpsc, Mutex as StdMutex};
+	use std::sync::{Mutex as StdMutex, mpsc};
 	use std::thread;
 	use std::time::{Duration, Instant};
 
@@ -676,9 +787,11 @@ mod tests {
 				.unwrap();
 		});
 		waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-		assert!(finished_rx
-			.recv_timeout(Duration::from_millis(100))
-			.is_err());
+		assert!(
+			finished_rx
+				.recv_timeout(Duration::from_millis(100))
+				.is_err()
+		);
 
 		finish_server_release(&lifecycle);
 		assert!(finished_rx.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -732,9 +845,11 @@ mod tests {
 			);
 			thread::yield_now();
 		}
-		assert!(released_rx
-			.recv_timeout(Duration::from_millis(100))
-			.is_err());
+		assert!(
+			released_rx
+				.recv_timeout(Duration::from_millis(100))
+				.is_err()
+		);
 
 		continue_tx.send(()).unwrap();
 		assert!(call_thread.join().unwrap().is_ok());
@@ -762,8 +877,10 @@ mod tests {
 
 		assert!(lifecycle_weak.upgrade().is_none());
 		drop(server_lifecycle(prune_trigger_id));
-		assert!(!SERVER_LIFECYCLE_CONTEXT
-			.read_recursive()
-			.contains_key(&context_id));
+		assert!(
+			!SERVER_LIFECYCLE_CONTEXT
+				.read_recursive()
+				.contains_key(&context_id)
+		);
 	}
 }

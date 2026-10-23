@@ -47,7 +47,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 /// Mwc's user agent with current version
-pub const USER_AGENT: &str = concat!("MW/MWC ", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("LOCAL-MW/MWC ", env!("CARGO_PKG_VERSION"));
 pub const ONION_PROOF_SIGNATURE_LEN: usize = 64;
 pub const ONION_PROOF_TIMESTAMP_LEN: usize = 8;
 
